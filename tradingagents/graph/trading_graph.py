@@ -270,6 +270,12 @@ class TradingAgentsGraph:
         """
         self.ticker = company_name
 
+        # Out-of-process providers (claude-code) need the analysis date explicitly:
+        # their tools run in a separate process and the CLI exposes the real date.
+        for llm in (self.deep_thinking_llm, self.quick_thinking_llm):
+            if hasattr(llm, "as_of_date"):
+                llm.as_of_date = str(trade_date)
+
         # Resolve any pending memory-log entries for this ticker before the pipeline runs.
         self._resolve_pending_entries(company_name)
 

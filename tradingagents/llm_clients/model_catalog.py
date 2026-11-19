@@ -36,6 +36,21 @@ MODEL_OPTIONS: ProviderModeOptions = {
             ("Claude Sonnet 4.5 - Agents and coding", "claude-sonnet-4-5"),
         ],
     },
+    # Claude Code CLI headless mode: model aliases resolve to the latest
+    # version the CLI knows; billed to the claude.ai subscription, no API key.
+    "claude-code": {
+        # Aliases follow whatever the installed CLI maps them to; update the CLI
+        # (npm install -g @anthropic-ai/claude-code@latest) to get newer models.
+        "quick": [
+            ("Sonnet (latest in your CLI) - Best speed and intelligence balance", "sonnet"),
+            ("Haiku (latest in your CLI) - Fast, lightest on usage limits", "haiku"),
+            ("Opus (latest in your CLI) - Most intelligent", "opus"),
+        ],
+        "deep": [
+            ("Opus (latest in your CLI) - Most intelligent", "opus"),
+            ("Sonnet (latest in your CLI) - Best speed and intelligence balance", "sonnet"),
+        ],
+    },
     "google": {
         "quick": [
             ("Gemini 3 Flash - Next-gen fast", "gemini-3-flash-preview"),
