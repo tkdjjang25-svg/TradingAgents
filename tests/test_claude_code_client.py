@@ -117,6 +117,11 @@ class TestChatClaudeCode(unittest.TestCase):
         self.assertEqual(json.loads(server["env"]["TA_MCP_TOOLS"]), [[get_stock_data.func.__module__, "get_stock_data"]])
         self.assertEqual(server["env"]["TA_MCP_AS_OF"], "2026-11-11")
         self.assertIn("data_vendors", json.loads(server["env"]["TA_MCP_CONFIG"]))
+        # schemas precomputed so the server can answer tools/list before importing the tools
+        schemas = json.loads(server["env"]["TA_MCP_SCHEMAS"])
+        self.assertEqual([s["name"] for s in schemas], ["get_stock_data"])
+        self.assertIn("symbol", schemas[0]["inputSchema"]["properties"])
+        self.assertIn("request all independent items", cli.systems[0])  # batching instruction for fewer turns
 
     def test_answer_without_tool_use_is_retried_then_rejected(self, _bin):
         cli = FakeCLI(tool_calls_per_run=(0, 1))

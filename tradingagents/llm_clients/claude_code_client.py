@@ -59,7 +59,13 @@ _TOOLS_NOTE = """
 Retrieve every price, indicator value, news item and financial figure you cite
 with the tools available to you. Never state a number that did not come from a
 tool result in this conversation or from a "User-provided notes" section of the
-prompt (label those as user-provided); if a tool fails, say the data is unavailable."""
+prompt (label those as user-provided); if a tool fails, say the data is unavailable.
+
+Each round of tool calls costs a full model turn, so batch them: decide up front
+which data you need and request all independent items in the same turn as parallel
+tool calls, instead of one call per turn. When a tool accepts a comma-separated list
+(for example several indicator names), pass the whole list in one call. Make a
+follow-up round only if the first results show you need something else."""
 
 _NO_TOOLS_RETRY = (
     "\n\n(Your previous attempt answered without calling any tool. Call the data tools "
@@ -133,7 +139,11 @@ def tool_ref(tool: Any) -> Dict[str, str]:
     func = getattr(tool, "func", None)
     if func is None:
         raise ValueError(f"ChatClaudeCode can only bind @tool functions, got {tool!r}")
-    return {"module": func.__module__, "name": tool.name}
+    from .claude_code_mcp import mcp_tool_schema
+
+    # The schema is computed here (langchain is already loaded) and handed to the MCP
+    # server, which can then answer tools/list before importing the heavy data modules.
+    return {"module": func.__module__, "name": tool.name, "schema": mcp_tool_schema(tool)}
 
 
 def resolve_claude_bin(explicit: Optional[str] = None) -> str:
@@ -166,6 +176,9 @@ def _subprocess_env() -> Dict[str, str]:
     # An API key in the environment takes priority over the subscription login,
     # which would defeat the purpose of this provider.
     env.pop("ANTHROPIC_API_KEY", None)
+    # The login gateway's per-run secret is only for app.py; the CLI and the MCP
+    # data server must not see it.
+    env.pop("TA_GATEWAY_SECRET", None)
     if env.pop("CLAUDECODE", None):
         # Launched from inside a Claude Code session: drop the host's session
         # wiring (proxy URL, session ids) so the child authenticates on its own.
@@ -229,6 +242,8 @@ def _mcp_config(tools: List[Dict[str, str]], as_of: Optional[str], log_path: Pat
                 "args": ["-m", "tradingagents.llm_clients.claude_code_mcp"],
                 "env": {
                     "TA_MCP_TOOLS": json.dumps([[t["module"], t["name"]] for t in tools]),
+                    "TA_MCP_SCHEMAS": json.dumps([t["schema"] for t in tools if t.get("schema")])
+                    if all(t.get("schema") for t in tools) else "",
                     "TA_MCP_CONFIG": json.dumps(get_config(), default=str),
                     "TA_MCP_AS_OF": as_of or "",
                     "TA_MCP_LOG": str(log_path),

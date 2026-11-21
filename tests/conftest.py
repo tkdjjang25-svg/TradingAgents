@@ -17,7 +17,8 @@ def pytest_configure(config):
     tmp_root.mkdir(parents=True, exist_ok=True)
     tempfile.tempdir = str(tmp_root)
     if not config.option.basetemp:
-        config.option.basetemp = str(tmp_root / "pytest")
+        # pytest empties basetemp at start, so concurrent runs each need their own folder
+        config.option.basetemp = str(tmp_root / f"pytest-{os.getpid()}")
 
 
 _API_KEY_ENV_VARS = (

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from langchain_core.tools import tool
 
-from tradingagents.llm_clients.claude_code_mcp import clamp_dates, handle
+from tradingagents.llm_clients.claude_code_mcp import clamp_dates, handle, mcp_tool_schema
 
 
 @tool
@@ -40,6 +40,17 @@ class TestClampDates(unittest.TestCase):
     def test_no_analysis_date_leaves_args_alone(self):
         args = {"end_date": "2030-01-01"}
         self.assertEqual(clamp_dates(args, None), args)
+
+    def test_padded_or_malformed_dates_cannot_bypass_the_cap(self):
+        out = clamp_dates({"curr_date": " 2099-12-31", "end_date": "2099/12/31", "start_date": " 2026-01-05 "},
+                          "2026-11-11")
+        self.assertEqual(out, {"curr_date": "2026-11-11", "end_date": "2026-11-11", "start_date": "2026-01-05"})
+
+    def test_missing_optional_date_is_filled_when_the_tool_accepts_it(self):
+        out = clamp_dates({"ticker": "NVDA"}, "2026-11-11", accepted={"ticker", "freq", "curr_date"})
+        self.assertEqual(out["curr_date"], "2026-11-11")
+        self.assertNotIn("end_date", out)  # not a parameter of this tool
+        self.assertEqual(clamp_dates({"ticker": "NVDA"}, "2026-11-11", accepted={"ticker"}), {"ticker": "NVDA"})
 
 
 @pytest.mark.unit
@@ -77,6 +88,52 @@ class TestHandle(unittest.TestCase):
     def test_unknown_tool_and_method_are_errors(self):
         self.assertIn("error", _call("tools/call", {"name": "nope", "arguments": {}}))
         self.assertEqual(_call("resources/list")["error"]["code"], -32601)
+
+    def test_precomputed_schemas_answer_tools_list_without_loaded_tools(self):
+        schemas = [mcp_tool_schema(get_stock_data)]
+        listing = handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, {}, None, None, schemas)
+        self.assertEqual(listing["result"]["tools"], schemas)
+        self.assertEqual(schemas[0]["name"], "get_stock_data")
+        self.assertIn("symbol", schemas[0]["inputSchema"]["properties"])
+
+
+@pytest.mark.unit
+class TestServerProcess(unittest.TestCase):
+    """Runs the real server as the CLI would: stdio JSON-RPC in a subprocess."""
+
+    def _run(self, env_extra, messages):
+        import os
+        import subprocess
+        import sys
+
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", **env_extra}
+        proc = subprocess.run(
+            [sys.executable, "-m", "tradingagents.llm_clients.claude_code_mcp"],
+            input="".join(json.dumps(m) + "\n" for m in messages), capture_output=True, text=True,
+            env=env, timeout=120, cwd=str(Path(__file__).resolve().parents[1]),
+        )
+        return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+
+    def test_lazy_loading_serves_list_then_runs_the_real_tool(self):
+        from tests.mcp_fixture_tools import echo_range
+
+        tools = [["tests.mcp_fixture_tools", "echo_range"]]
+        out = self._run(
+            {"TA_MCP_TOOLS": json.dumps(tools), "TA_MCP_SCHEMAS": json.dumps([mcp_tool_schema(echo_range)])},
+            [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+             {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+              "params": {"name": "echo_range", "arguments": {"symbol": "NVDA", "start_date": "a", "end_date": "b"}}}],
+        )
+        self.assertEqual(out[0]["result"]["tools"][0]["name"], "echo_range")
+        self.assertEqual(out[1]["result"]["content"][0]["text"], "NVDA a..b")
+
+    def test_tool_import_failure_is_reported_on_call(self):
+        out = self._run(
+            {"TA_MCP_TOOLS": json.dumps([["no_such_module_xyz", "t"]]), "TA_MCP_SCHEMAS": json.dumps([])},
+            [{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "t", "arguments": {}}}],
+        )
+        self.assertTrue(out[0]["result"]["isError"])
+        self.assertIn("failed to load", out[0]["result"]["content"][0]["text"])
 
 
 if __name__ == "__main__":

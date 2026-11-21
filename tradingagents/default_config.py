@@ -8,8 +8,15 @@ _TRADINGAGENTS_HOME = TRADINGAGENTS_HOME
 TMP_DIR = os.path.join(TRADINGAGENTS_HOME, "tmp")
 
 
+_YF_CACHE_SET = False
+
+
 def configure_yfinance_cache() -> None:
-    """yfinance 의 시간대 캐시를 data/cache/yfinance 로 (기본값은 사용자 AppData)."""
+    """yfinance 의 시간대·쿠키 캐시를 data/cache/yfinance 로 (기본값은 사용자 AppData). 한 번만 실행."""
+    global _YF_CACHE_SET
+    if _YF_CACHE_SET:
+        return
+    _YF_CACHE_SET = True
     try:
         import yfinance as yf
 

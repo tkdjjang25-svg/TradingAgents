@@ -139,6 +139,7 @@ def search(query: str, limit: int = 10) -> List[Tuple[str, str]]:
     if not query:
         return []
     try:
+        import tradingagents.dataflows  # noqa: F401  (yfinance 캐시를 data/cache/yfinance 로)
         import yfinance as yf
 
         quotes = yf.Search(query, max_results=limit, news_count=0).quotes

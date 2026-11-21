@@ -146,7 +146,7 @@ def classify_pending(conn: sqlite3.Connection, since: str, until: Optional[str] 
         found: Dict[int, List[_Event]] = {}
         if worth:
             posts = "\n\n".join(
-                f"### msg_id={r['msg_id']} date={r['date']}\n{(r['text'] or '')[:1500]}" for r in worth
+                f"### msg_id={r['msg_id']} date={r['date']}\n{_untrusted(r['text'])[:1500]}" for r in worth
             )
             from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -169,6 +169,14 @@ def classify_pending(conn: sqlite3.Connection, since: str, until: Optional[str] 
         done += len(batch)
         log.info("분류 %d/%d건 (이벤트 %d건)", done, len(rows), sum(len(v) for v in found.values()))
     return done
+
+
+def _untrusted(text: Optional[str]) -> str:
+    """채널 글은 외부 입력이다. 구분자(<<< >>>)와 분류 배치의 글 머리(### msg_id=)를
+    흉내 내 다른 글이나 지시처럼 보이게 하는 것을 막는다."""
+    from tradingagents.agents.utils.agent_utils import fence_untrusted
+
+    return re.sub(r"(?im)^\s*#{1,6}\s*msg_id\s*=", "msg_id=", fence_untrusted(text or ""))
 
 
 _TICKER_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^]{0,19}$")
@@ -227,6 +235,7 @@ def _fmt(x, digits=2, suffix="%") -> str:
 
 def price_reaction(ticker: str, news_utc: datetime, today: Optional[datetime] = None) -> Dict[str, Any]:
     """yfinance 일봉으로 D-5 ~ D+20 반응과 요약 지표를 계산한다."""
+    import tradingagents.dataflows  # noqa: F401  (yfinance 캐시를 data/cache/yfinance 로)
     import yfinance as yf
 
     today = today or datetime.now(timezone.utc)
@@ -293,6 +302,7 @@ def _benchmark_line(ticker: str, news_utc: datetime) -> str:
 
 
 def _company_line(ticker: str) -> str:
+    import tradingagents.dataflows  # noqa: F401  (yfinance 캐시를 data/cache/yfinance 로)
     import yfinance as yf
 
     parts = []
@@ -339,7 +349,7 @@ def build_input(events: List[sqlite3.Row], messages: List[sqlite3.Row], reaction
     )
     kinds = "; ".join(f"{e['event_type']} — {e['headline']}" for e in events)
     news = "\n".join(
-        f"[{m['date']} UTC 게시]\n<<<\n{(m['text'] or '')[:4000]}\n>>>" for m in messages[:4]
+        f"[{m['date']} UTC 게시]\n<<<\n{_untrusted(m['text'])[:4000]}\n>>>" for m in messages[:4]
     )
     return f"""# 입력 데이터 (Input Data)
 - **문서 단계:** {stage_note}

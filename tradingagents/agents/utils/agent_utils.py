@@ -43,6 +43,16 @@ def build_instrument_context(ticker: str, user_notes: str = "") -> str:
     ) + build_user_notes(user_notes)
 
 
+def fence_untrusted(text: str) -> str:
+    """Neutralise the <<< >>> fence markers inside untrusted text.
+
+    Notes and channel posts are wrapped in <<< >>> so the model can tell data from
+    instructions; text containing those markers could otherwise close the fence early
+    and smuggle in instructions that look like they come from outside it.
+    """
+    return (text or "").replace("<<<", "‹‹‹").replace(">>>", "›››")
+
+
 def build_user_notes(user_notes: str) -> str:
     """Prompt section for notes typed by the person who requested the analysis.
 
@@ -59,7 +69,7 @@ def build_user_notes(user_notes: str) -> str:
         "tool data and may be wrong or incomplete. Consider every point in them, say "
         "explicitly how each one affects your view (or why it does not), and label any "
         "figure taken from them as \"user-provided\". Do not invent details beyond what "
-        "they state.\n<<<\n" + notes + "\n>>>\n"
+        "they state.\n<<<\n" + fence_untrusted(notes) + "\n>>>\n"
     )
 
 def create_msg_delete():
