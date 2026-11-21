@@ -67,6 +67,14 @@ _NO_TOOLS_RETRY = (
 )
 
 
+def _tmp_root() -> str:
+    """CLI 작업 폴더와 임시 파일은 시스템 임시 폴더가 아니라 저장소 data/tmp 에 둔다."""
+    from tradingagents.default_config import TMP_DIR
+
+    os.makedirs(TMP_DIR, exist_ok=True)
+    return TMP_DIR
+
+
 def _text(content: Any) -> str:
     """Flatten LangChain message content (str or list of blocks) to text."""
     if isinstance(content, str):
@@ -187,7 +195,7 @@ def resolve_model_id(model: str, claude_bin: Optional[str] = None, timeout: floa
     try:
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", env=_subprocess_env(), cwd=tempfile.gettempdir(),
+            text=True, encoding="utf-8", env=_subprocess_env(), cwd=_tmp_root(),
         )
     except OSError:
         return None
@@ -311,7 +319,7 @@ class ChatClaudeCode(BaseChatModel):
         response_schema: Optional[Dict[str, Any]],
         tools: Optional[List[Dict[str, str]]] = None,
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        with tempfile.TemporaryDirectory(prefix="ta-claude-") as workdir:
+        with tempfile.TemporaryDirectory(prefix="ta-claude-", dir=_tmp_root(), ignore_cleanup_errors=True) as workdir:
             # The system prompt goes through a file: analyst prompts can exceed
             # the Windows command-line limit (~32K chars).
             system_file = Path(workdir) / "system.txt"

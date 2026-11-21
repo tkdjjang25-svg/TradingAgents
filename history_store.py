@@ -1,6 +1,6 @@
 """분석 이력 저장소 (app.py 전용).
 
-분석 1건을 ~/.tradingagents/history/<id>.json 파일 하나로 보관한다.
+분석 1건을 data/history/<id>.json 파일 하나로 보관한다.
 
 엔진도 결과를 results_dir/<티커>/TradingAgentsStrategy_logs/full_states_log_<기준일>.json 에
 남기지만, 같은 종목·기준일로 다시 분석하면 덮어써지고 모델·소요시간 같은 정보가 없다.
@@ -12,11 +12,13 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
+
+from tradingagents.default_config import TRADINGAGENTS_HOME
 from typing import Any, Dict, List, Optional
 
 from tradingagents.agents.utils.rating import parse_rating
 
-HISTORY_DIR = Path.home() / ".tradingagents" / "history"
+HISTORY_DIR = Path(TRADINGAGENTS_HOME) / "history"
 
 # 막 쓰인 엔진 로그는 앱의 save_run()이 곧 참조할 수 있으므로 가져오기를 잠시 미룬다.
 _IMPORT_GRACE_SEC = 30

@@ -15,13 +15,15 @@ import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from tradingagents.default_config import TRADINGAGENTS_HOME
 from typing import Callable, List, Optional, Tuple
 
 from langchain_core.callbacks import BaseCallbackHandler
 
 import history_store
 
-QUEUE_FILE = Path.home() / ".tradingagents" / "queue.json"
+QUEUE_FILE = Path(TRADINGAGENTS_HOME) / "queue.json"
 MAX_QUEUED = 30
 KEEP_FINISHED = 30
 
