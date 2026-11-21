@@ -199,6 +199,13 @@ def read_messages(query: str = "", limit: int = 500, path: Path = DB_PATH):
 # ---------------------------------------------------------------------------
 # Telethon
 # ---------------------------------------------------------------------------
+def secure_data_dir(path: Path = DATA_DIR) -> bool:
+    """세션 파일(계정 로그인과 같은 효력)이 있는 폴더를 이 계정·SYSTEM·관리자만 쓰게 한다."""
+    import local_security
+
+    return local_security.secure_dir(path)
+
+
 def _client():
     from telethon import TelegramClient
 
@@ -209,7 +216,8 @@ def _client():
             "TELEGRAM_API_ID / TELEGRAM_API_HASH 가 .env 에 없습니다. "
             "https://my.telegram.org 의 API development tools 에서 발급받아 넣어 주세요."
         )
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not secure_data_dir(DATA_DIR):
+        log.warning("세션 폴더 권한을 제한하지 못했습니다: %s", DATA_DIR)
     return TelegramClient(str(SESSION_PATH), int(api_id), api_hash)
 
 

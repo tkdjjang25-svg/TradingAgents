@@ -75,6 +75,7 @@ class Job:
     params: dict  # 실행 조건 (화면 표시·이력 저장용)
     config: dict
     requester: str = ""
+    owner: str = ""  # 로그인 세션 식별자 (게이트웨이가 준 값). 이 세션만 작업을 취소할 수 있다
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     created: float = field(default_factory=time.time)
     started: Optional[float] = None
@@ -101,7 +102,7 @@ class Job:
     def to_saved(self) -> dict:
         return {
             "id": self.id, "params": self.params, "config": self.config,
-            "requester": self.requester, "created": self.created,
+            "requester": self.requester, "owner": self.owner, "created": self.created,
         }
 
 
@@ -190,6 +191,14 @@ def run_job(job: Job, graph_factory: Callable) -> None:
         job.finished = job.finished or time.time()
 
 
+def can_cancel(job: Job, owner: Optional[str]) -> bool:
+    """owner=None 은 내부 호출(제한 없음). 소유자가 기록된 작업은 같은 세션만 취소할 수 있다."""
+    if owner is None:
+        return True
+    job_owner = getattr(job, "owner", "")
+    return bool(job_owner) and job_owner == owner
+
+
 class JobQueue:
     """서버 전체가 공유하는 분석 대기열. 작업 스레드 하나가 순서대로 처리한다.
 
@@ -230,7 +239,7 @@ class JobQueue:
             return next((j for j in self._jobs if j.id == job_id), None)
 
     # ----- 변경 -------------------------------------------------------------
-    def submit(self, params: dict, config: dict, requester: str = "") -> Tuple[Job, int]:
+    def submit(self, params: dict, config: dict, requester: str = "", owner: str = "") -> Tuple[Job, int]:
         """작업을 맨 뒤에 넣고 (작업, 앞에 있는 작업 수)를 반환한다."""
         with self._cond:
             active = [j for j in self._jobs if j.active]
@@ -239,16 +248,19 @@ class JobQueue:
                     raise DuplicateJob(j)
             if sum(j.status == "queued" for j in active) >= MAX_QUEUED:
                 raise QueueFull()
-            job = Job(params=params, config=config, requester=requester.strip())
+            job = Job(params=params, config=config, requester=requester.strip(), owner=owner)
             self._jobs.append(job)
             self._changed()
             return job, len(active)
 
-    def cancel(self, job_id: str) -> bool:
-        """대기 중이면 바로 빼고, 실행 중이면 다음 LLM 호출 직전에 멈추도록 표시한다."""
+    def cancel(self, job_id: str, owner: Optional[str] = None) -> bool:
+        """대기 중이면 바로 빼고, 실행 중이면 다음 LLM 호출 직전에 멈추도록 표시한다.
+
+        owner 를 주면 그 세션이 넣은 작업만 취소한다 (다른 사람 작업은 False).
+        """
         with self._cond:
             job = next((j for j in self._jobs if j.id == job_id), None)
-            if job is None or not job.active:
+            if job is None or not job.active or not can_cancel(job, owner):
                 return False
             if job.status == "queued":
                 job.status, job.finished = "cancelled", time.time()
@@ -328,6 +340,7 @@ class JobQueue:
             self._jobs.append(
                 Job(
                     params=item["params"], config=item["config"], requester=item.get("requester", ""),
+                    owner=item.get("owner", ""),
                     id=item.get("id") or uuid.uuid4().hex[:8], created=item.get("created") or time.time(),
                 )
             )

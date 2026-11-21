@@ -220,3 +220,8 @@ __marimo__/
 
 # Local runtime data (history, queue, telegram db/session, reports, logs, caches, temp)
 /data/
+# Telegram login sessions and collected message databases, wherever they end up
+*.session
+*.session-journal
+messages.db
+messages.db-*

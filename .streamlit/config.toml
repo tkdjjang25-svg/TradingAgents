@@ -1,0 +1,14 @@
+# Streamlit 은 이 PC 안(127.0.0.1)에서만 열린다. 사내망 접속은 로그인 게이트웨이
+# (auth_gateway.py serve, 기본 0.0.0.0:8501) 를 통해서만 가능하다.
+[server]
+address = "127.0.0.1"
+port = 8502
+headless = true
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# 예상 못한 오류가 나도 traceback(내부 경로)을 화면에 보이지 않는다. 상세 내용은 서버 로그에 남는다.
+showErrorDetails = "none"

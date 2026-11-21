@@ -37,8 +37,8 @@ class TestTelegramCollector(unittest.TestCase):
         row = tc.message_row(_msg(5, reply_to=SimpleNamespace(reply_to_msg_id=3)), -1001234567890)
         self.assertEqual(row["date"], "2026-11-21T01:02:03+00:00")
         self.assertEqual((row["sender_name"], row["text"], row["reply_to"]), ("Min Su", "hello", 3))
-        channel_post = tc.message_row(_msg(6, sender=SimpleNamespace(title="SAVE 채널")), -1001234567890)
-        self.assertEqual(channel_post["sender_name"], "SAVE 채널")
+        channel_post = tc.message_row(_msg(6, sender=SimpleNamespace(title="Test 채널")), -1001234567890)
+        self.assertEqual(channel_post["sender_name"], "Test 채널")
 
     def test_upsert_counts_new_and_updated_and_read_back(self):
         with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

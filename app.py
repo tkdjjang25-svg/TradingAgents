@@ -1,12 +1,15 @@
 """TradingAgents Streamlit UI (한글).
 
-실행:
-    .venv\\Scripts\\python.exe -m streamlit run app.py
+실행 (로그인 게이트웨이를 통해서만 접속 가능):
+    .venv\\Scripts\\python.exe auth_gateway.py serve
 
 분석은 서버의 백그라운드 스레드에서 돌기 때문에, 실행 중에 화면을 조작하거나
 브라우저를 닫아도 중단되지 않는다. 끝난 분석은 history_store가 자동 저장한다.
 """
+import hmac
 import json
+import logging
+import os
 import time
 from datetime import date
 from pathlib import Path
@@ -38,7 +41,29 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+# ---------------------------------------------------------------------------
+# 접근 제어: 로그인 게이트웨이(auth_gateway.py)를 거친 요청만 받는다.
+# 게이트웨이는 실행할 때마다 새 비밀값을 TA_GATEWAY_SECRET 으로 넘기고, 모든 요청에
+# X-TA-Gateway 헤더로 붙인다. 이 값이 없거나 다르면 (예: 같은 PC 에서 Streamlit 포트로
+# 직접 접속) 화면을 보여주지 않는다.
+# ---------------------------------------------------------------------------
+def _gateway_session() -> str:
+    expected = os.environ.get("TA_GATEWAY_SECRET", "")
+    headers = st.context.headers
+    sent = headers.get("X-TA-Gateway", "") or ""
+    if not expected or not hmac.compare_digest(sent.encode(), expected.encode()):
+        st.error("🔒 로그인 게이트웨이를 통해서만 접속할 수 있습니다. 관리자에게 접속 주소를 문의하세요.")
+        st.stop()
+    return headers.get("X-TA-Session", "") or ""
+
+
+SESSION_ID = _gateway_session()
+log = logging.getLogger("app")
+
 st.title("📈 TradingAgents")
+# 로그아웃은 게이트웨이의 /logout (세션 폐기 + 쿠키 삭제) 으로
+st.sidebar.link_button("🔓 로그아웃", "/logout", width="stretch")
 st.caption("LangGraph + LLM 기반 멀티에이전트 트레이딩 분석")
 
 
@@ -397,10 +422,13 @@ def _show_running(job, cancellable: bool) -> None:
         for step in job.steps:
             st.write(step)
     if cancellable and not job.cancel_requested:
-        if st.button("⏹ 이 분석 중단", key=f"stop_{job.id}",
-                     help="지금 진행 중인 LLM 호출이 끝나면 멈춥니다. 다른 사람의 작업일 수 있으니 확인하고 누르세요."):
-            queue.cancel(job.id)
-            st.rerun()
+        if job_queue.can_cancel(job, SESSION_ID):
+            if st.button("⏹ 이 분석 중단", key=f"stop_{job.id}",
+                         help="지금 진행 중인 LLM 호출이 끝나면 멈춥니다."):
+                queue.cancel(job.id, owner=SESSION_ID)
+                st.rerun()
+        else:
+            st.caption("다른 사람이 요청한 분석이라 중단할 수 없습니다.")
 
 
 @st.fragment(run_every=3)
@@ -436,8 +464,8 @@ def queue_panel() -> None:
                 f"**{n}.** `{p['ticker']}` · {p['trade_date']} · 심층 `{p['deep_model']}` · 빠른 `{p['quick_model']}` · "
                 f"토론 {p['debate_rounds']}/{p['risk_rounds']} · 요청 {_who(job)} · {_clock(job.created)} 추가"
             )
-            if c2.button("취소", key=f"cancel_{job.id}"):
-                queue.cancel(job.id)
+            if job_queue.can_cancel(job, SESSION_ID) and c2.button("취소", key=f"cancel_{job.id}"):
+                queue.cancel(job.id, owner=SESSION_ID)
                 st.rerun()
     st.caption("창을 닫아도 분석은 서버에서 계속되고, 끝나면 📚 분석 이력에 자동 저장됩니다. "
                "서버를 다시 켜면 대기 중이던 작업도 이어서 처리합니다.")
@@ -454,8 +482,13 @@ def show_finished(job, key_prefix: str) -> None:
     elif job.status == "cancelled":
         st.info(f"⏹ 취소됨 · {'경과 ' + _mmss(job.elapsed) if job.started else '시작 전에 취소'}")
     else:
-        st.error(f"❌ 분석 실패 · 경과 {_mmss(job.elapsed)}")
-        st.code(job.error)
+        # 상세 오류(내부 경로가 담긴 traceback)는 화면에 보여주지 않고 서버 로그에만 남긴다.
+        if not getattr(job, "_error_logged", False):
+            log.error("분석 실패 (작업 %s):\n%s", job.id, job.error)
+            job._error_logged = True
+        last = (job.error or "").strip().splitlines()[-1:] or [""]
+        kind = last[0].split(":", 1)[0].rsplit(".", 1)[-1] if last[0] else "알 수 없는 오류"
+        st.error(f"❌ 분석 실패 · 경과 {_mmss(job.elapsed)} · 오류 종류: `{kind}` (자세한 내용은 서버 로그 참고)")
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +522,7 @@ if run_button:
             notes=notes.strip(),
         )
         try:
-            job, ahead = queue.submit(params, config, requester=requester)
+            job, ahead = queue.submit(params, config, requester=requester, owner=SESSION_ID)
         except job_queue.DuplicateJob as dup:
             st.sidebar.warning(f"같은 조건의 분석이 이미 대기열에 있습니다 (요청 {_who(dup.job)}).")
         except job_queue.QueueFull:
