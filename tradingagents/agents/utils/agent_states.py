@@ -72,3 +72,4 @@ class AgentState(MessagesState):
     final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]
     past_context: Annotated[str, "Memory log context injected at run start (same-ticker decisions + cross-ticker lessons)"]
     user_notes: Annotated[str, "Free-text notes from the person who requested the analysis (unverified)"]
+    user_position: Annotated[str, "Prompt section stating whether the requester already holds the instrument"]

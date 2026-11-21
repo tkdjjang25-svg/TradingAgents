@@ -270,6 +270,31 @@ with st.sidebar:
     risk_rounds = st.slider("리스크 토론 라운드", 1, 5, 1)
 
     st.divider()
+    # 보유 여부·평균단가도 종목별로 기억한다. 입력하지 않으면 '미보유' 전제로 결정이 나온다.
+    positions_by_ticker = st.session_state.setdefault("positions_by_ticker", {})
+    saved_pos = positions_by_ticker.get(ticker, {"held": False, "avg_price": None})
+    held_label = st.radio(
+        f"💼 보유 여부 — {ticker}",
+        ["미보유", "보유 중"],
+        index=1 if saved_pos["held"] else 0,
+        key=f"held::{ticker}",
+        horizontal=True,
+        help="결정을 내 상황 기준으로 받습니다. 미보유면 '지금 살지 말지', 보유 중이면 '더 살지·유지할지·팔지'로 답합니다.",
+    )
+    held = held_label == "보유 중"
+    avg_price = None
+    if held:
+        avg_price = st.number_input(
+            "평균단가 (선택 · 종목 표시 통화 기준)",
+            min_value=0.0,
+            value=float(saved_pos["avg_price"] or 0.0),
+            step=1.0,
+            format="%.4g",
+            key=f"avg::{ticker}",
+            help="0이면 평균단가 없이 '보유 중'만 전달합니다. 손익 언급에만 쓰이고 매수가에 얽매인 판단은 하지 않게 지시합니다.",
+        ) or None
+    positions_by_ticker[ticker] = {"held": held, "avg_price": avg_price}
+
     # 메모는 종목별로 따로 기억한다 (삼성전자용 메모가 다른 종목 분석에 섞이지 않게).
     notes_by_ticker = st.session_state.setdefault("notes_by_ticker", {})
     notes = st.text_area(
@@ -330,6 +355,11 @@ def render_record(record: dict, key_prefix: str) -> None:
         ko, desc = history_store.DECISION_KO[decision]
         box = {"Buy": st.success, "Overweight": st.success, "Hold": st.info}.get(decision, st.error)
         box(f"**{ko}** ({decision}) — {desc}")
+        action = history_store.action_ko(record)
+        st.markdown(f"💼 **포지션** {history_store.position_ko(record)} → 👉 **할 일: {action}**")
+        if "position" not in record:
+            st.caption("보유 여부를 입력하기 전에 실행한 분석이라 본문은 '보유 중' 전제로 쓰였을 수 있습니다. "
+                       "위의 '할 일'은 미보유 기준으로 풀어 쓴 것입니다.")
     else:
         st.info(record.get("decision") or "(없음)")
     with st.expander("최종 의사결정 원문 보기"):
@@ -395,6 +425,7 @@ def _params_line(p: dict) -> str:
         f"**종목** `{p['ticker']}` · **기준일** `{p['trade_date']}` · **모델** `{p['provider']}` · "
         f"심층 `{p['deep_model']}` · 빠른 `{p['quick_model']}` · **분석가** {history_store.analysts_ko(p['analysts'])} · "
         f"**토론** {p['debate_rounds']}/{p['risk_rounds']}라운드 · **언어** {p['language']}"
+        + f" · **💼 포지션** {history_store.position_ko(p)}"
         + (f" · **📝 메모** {len(p['notes'])}자" if p.get("notes") else "")
     )
 
@@ -520,6 +551,7 @@ if run_button:
             risk_rounds=risk_rounds,
             language=lang_label,
             notes=notes.strip(),
+            position=positions_by_ticker[ticker],
         )
         try:
             job, ahead = queue.submit(params, config, requester=requester, owner=SESSION_ID)
@@ -580,6 +612,8 @@ with tab_history:
                 "종목": [r["ticker"] for r in shown],
                 "기준일": [r["trade_date"] for r in shown],
                 "결정": [history_store.decision_ko(r.get("decision")) or "-" for r in shown],
+                "포지션": [history_store.position_ko(r) for r in shown],
+                "할 일": [history_store.action_ko(r) or "-" for r in shown],
                 "모델": [
                     f"{r['provider']} · {r.get('deep_model')}/{r.get('quick_model')}" if r.get("provider") else "-"
                     for r in shown

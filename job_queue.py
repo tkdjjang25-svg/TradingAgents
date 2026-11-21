@@ -22,6 +22,7 @@ from typing import Callable, List, Optional, Tuple
 from langchain_core.callbacks import BaseCallbackHandler
 
 import history_store
+from tradingagents.agents.utils.agent_utils import normalize_position
 
 QUEUE_FILE = Path(TRADINGAGENTS_HOME) / "queue.json"
 MAX_QUEUED = 30
@@ -160,7 +161,7 @@ def run_job(job: Job, graph_factory: Callable) -> None:
     p = job.params
     try:
         ta = graph_factory(selected_analysts=p["analysts"], debug=False, config=job.config, callbacks=[progress])
-        final_state, decision = ta.propagate(p["ticker"], p["trade_date"], user_notes=p.get("notes", ""))
+        final_state, decision = ta.propagate(p["ticker"], p["trade_date"], user_notes=p.get("notes", ""), position=p.get("position"))
         progress.finish()
         job.finished = time.time()
         engine_log = (
@@ -178,6 +179,7 @@ def run_job(job: Job, graph_factory: Callable) -> None:
             meta["requester"] = job.requester
         if p.get("notes"):
             meta["notes"] = p["notes"]
+        meta["position"] = normalize_position(p.get("position"))
         job.record_id = history_store.save_run(final_state, decision, meta, engine_log).stem
         job.status = "done"
     except Exception as exc:

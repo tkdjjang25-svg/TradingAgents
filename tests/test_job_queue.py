@@ -158,8 +158,9 @@ class FakeGraph:
         self.callbacks = callbacks
         self.llm = FakeListChatModel(responses=["ok"] * 10)
 
-    def propagate(self, ticker, trade_date, user_notes=""):
+    def propagate(self, ticker, trade_date, user_notes="", position=None):
         self.hooks["user_notes"] = user_notes
+        self.hooks["position"] = position
         for i in range(self.calls_before_return):
             self.llm.invoke("hi", config={"callbacks": self.callbacks, "metadata": {"langgraph_node": "Market Analyst"}})
             if i == 0 and "first_call" in self.hooks:
@@ -196,6 +197,16 @@ class TestRunJob(unittest.TestCase):
             record = job_queue.history_store.load_run(job.record_id)
         self.assertEqual(FakeGraph.hooks["user_notes"], "1월 말 주주환원 발표 예정")
         self.assertEqual(record["notes"], "1월 말 주주환원 발표 예정")
+        self.assertEqual(record["position"], {"held": False, "avg_price": None})  # default: not held
+
+    def test_position_reaches_the_graph_and_the_saved_record(self):
+        pos = {"held": True, "avg_price": 210000.0}
+        job = Job(params=_params(position=pos), config=self.config)
+        with patch.object(job_queue.history_store, "HISTORY_DIR", Path(self.tmp.name) / "h"):
+            run_job(job, FakeGraph)
+            record = job_queue.history_store.load_run(job.record_id)
+        self.assertEqual(FakeGraph.hooks["position"], pos)
+        self.assertEqual(record["position"], pos)
 
     def test_cancel_request_stops_at_the_next_llm_call(self):
         job = Job(params=_params(), config=self.config)

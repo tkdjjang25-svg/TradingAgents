@@ -25,7 +25,7 @@ def create_portfolio_manager(llm):
     structured_llm = bind_structured(llm, PortfolioDecision, "Portfolio Manager")
 
     def portfolio_manager_node(state) -> dict:
-        instrument_context = build_instrument_context(state["company_of_interest"], state.get("user_notes", ""))
+        instrument_context = build_instrument_context(state["company_of_interest"], state.get("user_notes", ""), state.get("user_position", ""))
 
         history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
@@ -45,11 +45,11 @@ def create_portfolio_manager(llm):
 
 ---
 
-**Rating Scale** (use exactly one):
+**Rating Scale** (use exactly one; apply it to the requester's current position stated above):
 - **Buy**: Strong conviction to enter or add to position
 - **Overweight**: Favorable outlook, gradually increase exposure
-- **Hold**: Maintain current position, no action needed
-- **Underweight**: Reduce exposure, take partial profits
+- **Hold**: No change — keep an existing position as is; with no position, do not buy yet
+- **Underweight**: Reduce exposure (take partial profits); with no position, stay out
 - **Sell**: Exit position or avoid entry
 
 **Context:**

@@ -16,6 +16,7 @@ from pathlib import Path
 from tradingagents.default_config import TRADINGAGENTS_HOME
 from typing import Any, Dict, List, Optional
 
+from tradingagents.agents.utils.agent_utils import format_price, normalize_position
 from tradingagents.agents.utils.rating import parse_rating
 
 HISTORY_DIR = Path(TRADINGAGENTS_HOME) / "history"
@@ -177,6 +178,44 @@ DECISION_KO = {
     "Sell": ("매도", "보유량을 팔라는 의견"),
 }
 
+# 같은 등급이라도 지금 보유 중인지에 따라 실제로 할 일이 다르다.
+ACTION_KO = {
+    False: {
+        "Buy": "지금 신규 매수",
+        "Overweight": "분할 매수로 일부만 진입",
+        "Hold": "매수 보류 · 관망",
+        "Underweight": "매수하지 않음",
+        "Sell": "매수하지 않음 (진입 회피)",
+    },
+    True: {
+        "Buy": "추가 매수",
+        "Overweight": "조금씩 추가 매수",
+        "Hold": "보유분 유지 (사고팔지 않음)",
+        "Underweight": "일부 매도 (비중 축소)",
+        "Sell": "전량 매도",
+    },
+}
+
+
+def position_of(record: Dict[str, Any]) -> Dict[str, Any]:
+    """기록된 포지션. 입력이 없던 분석은 '미보유'로 본다."""
+    return normalize_position(record.get("position"))
+
+
+def position_ko(record: Dict[str, Any]) -> str:
+    if "position" not in record:
+        return "미입력 (미보유로 간주)"
+    pos = position_of(record)
+    if not pos["held"]:
+        return "미보유"
+    return "보유 중" + (f" · 평단 {format_price(pos['avg_price'])}" if pos["avg_price"] else "")
+
+
+def action_ko(record: Dict[str, Any]) -> str:
+    """포지션 기준으로 이 결정이 뜻하는 행동. 알 수 없는 등급이면 빈 문자열."""
+    decision = (record.get("decision") or "").strip().capitalize()
+    return ACTION_KO[position_of(record)["held"]].get(decision, "")
+
 
 def decision_ko(decision: Optional[str]) -> str:
     """'Underweight' → '비중 축소 (Underweight)'. 모르는 값은 그대로 둔다."""
@@ -200,6 +239,7 @@ def to_markdown(record: Dict[str, Any]) -> str:
     meta = [
         f"- 저장 시각: {record.get('saved_at', '')}",
         f"- 최종 결정: **{decision_ko(record.get('decision')) or '-'}**",
+        f"- 포지션: {position_ko(record)} → 할 일: **{action_ko(record) or '-'}**",
         f"- 분석가: {analysts_ko(record.get('analysts')) or '-'}",
     ]
     if record.get("provider"):

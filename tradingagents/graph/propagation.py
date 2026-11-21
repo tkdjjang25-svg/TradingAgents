@@ -6,6 +6,7 @@ from tradingagents.agents.utils.agent_states import (
     InvestDebateState,
     RiskDebateState,
 )
+from tradingagents.agents.utils.agent_utils import build_position_context
 
 
 class Propagator:
@@ -16,7 +17,8 @@ class Propagator:
         self.max_recur_limit = max_recur_limit
 
     def create_initial_state(
-        self, company_name: str, trade_date: str, past_context: str = "", user_notes: str = ""
+        self, company_name: str, trade_date: str, past_context: str = "", user_notes: str = "",
+        position: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """Create the initial state for the agent graph."""
         return {
@@ -25,6 +27,8 @@ class Propagator:
             "trade_date": str(trade_date),
             "past_context": past_context,
             "user_notes": user_notes.strip(),
+            # No position given means "not held": the advice is about opening one.
+            "user_position": build_position_context(position),
             "investment_debate_state": InvestDebateState(
                 {
                     "bull_history": "",
