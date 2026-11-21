@@ -23,6 +23,8 @@ from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 import history_store
+import news_event_agent
+import telegram_collector
 import job_queue
 import ticker_catalog
 
@@ -499,7 +501,9 @@ if run_button:
 # ---------------------------------------------------------------------------
 # 메인 패널
 # ---------------------------------------------------------------------------
-tab_run, tab_history = st.tabs(["🚀 분석 · 대기열", "📚 분석 이력"])
+tab_run, tab_history, tab_telegram, tab_events = st.tabs(
+    ["🚀 분석 · 대기열", "📚 분석 이력", "📨 텔레그램", "🧠 이벤트 분석"]
+)
 
 with tab_run:
     queue_panel()
@@ -563,3 +567,86 @@ with tab_history:
         if event.selection.rows:
             st.divider()
             render_record(history_store.load_run(shown[event.selection.rows[0]]["id"]), key_prefix="history")
+
+
+with tab_telegram:
+    data = telegram_collector.read_messages(st.text_input("🔎 메시지 검색", placeholder="내용·작성자 일부"), limit=500)
+    if data is None:
+        st.info(
+            "아직 수집된 텔레그램 메시지가 없습니다. 수집기를 처음 쓰는 순서:\n\n"
+            "1. https://my.telegram.org → **API development tools** 에서 `api_id`, `api_hash` 발급\n"
+            "2. `.env` 의 `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` 에 입력\n"
+            "3. 터미널에서 로그인: `.venv/Scripts/python.exe telegram_collector.py login`\n"
+            "4. 수집 시작 (5분마다): `.venv/Scripts/python.exe telegram_collector.py run`"
+        )
+    else:
+        runs = data["runs"]
+        last = runs[0] if runs else None
+        cols = st.columns(3)
+        cols[0].metric("저장된 메시지", f"{data['total']:,}건")
+        if last:
+            when = pd.Timestamp(last["finished_at"]).tz_convert("Asia/Seoul").strftime("%m-%d %H:%M")
+            cols[1].metric("마지막 수집", when)
+            cols[2].metric("직전 수집 결과", f"새 글 {last['new']}건" if not last["error"] else "실패")
+            if last["error"]:
+                st.warning(f"마지막 수집 실패: {last['error']}", icon="⚠️")
+        msgs = data["messages"]
+        if msgs:
+            df = pd.DataFrame(msgs)
+            df["시각"] = pd.to_datetime(df["date"], utc=True).dt.tz_convert("Asia/Seoul").dt.strftime("%Y-%m-%d %H:%M")
+            view = df.rename(columns={"title": "방", "sender_name": "작성자", "text": "내용", "views": "조회",
+                                      "media": "첨부", "link": "링크"})[["시각", "방", "작성자", "내용", "조회", "첨부", "링크"]]
+            st.caption(f"최신 {len(view)}건 표시 · 보관 위치 `{telegram_collector.DB_PATH}`")
+            st.dataframe(view, hide_index=True, width="stretch",
+                         column_config={"링크": st.column_config.LinkColumn("링크", display_text="열기")})
+            st.download_button("📄 CSV로 내려받기", view.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="telegram_messages.csv", mime="text/csv")
+
+
+with tab_events:
+    reports = news_event_agent.read_reports(limit=500)
+    st.caption(
+        "텔레그램 뉴스 중 주가를 움직일 만한 이벤트를 골라 '이벤트 드리븐 퀀트 애널리스트' 역할로 분석한 문서입니다. "
+        "1차(D0)는 뉴스가 반영된 첫 거래일 장 마감 뒤, 최종(D+20)은 20거래일 뒤에 다시 씁니다. "
+        f"보관 위치 `{news_event_agent.REPORT_DIR}`"
+    )
+    if not reports:
+        st.info("아직 작성된 문서가 없습니다. 이벤트 분석 에이전트(`news_event_agent.py run`)가 켜져 있어야 합니다.")
+    else:
+        c1, c2, c3 = st.columns([2, 2, 3])
+        tickers = sorted({r["ticker"] for r in reports})
+        pick_t = c1.multiselect("종목", tickers, placeholder="전체")
+        kinds = sorted({r["event_type"] for r in reports})
+        pick_k = c2.multiselect("이벤트 유형", kinds, placeholder="전체")
+        words = c3.text_input("요약 검색", placeholder="예: 자사주, 셀온, 가이던스")
+        shown = [
+            r for r in reports
+            if (not pick_t or r["ticker"] in pick_t) and (not pick_k or r["event_type"] in pick_k)
+            and (not words or words in (r["summary"] or "") or words in (r["headline"] or ""))
+        ]
+        # 같은 문서를 가리키는 글(같은 종목·같은 날 묶음)은 한 줄만
+        seen, rows = set(), []
+        for r in shown:
+            if r["path"] not in seen:
+                seen.add(r["path"])
+                rows.append(r)
+        df = pd.DataFrame({
+            "뉴스 일시": [pd.Timestamp(r["news_date"]).tz_convert("Asia/Seoul").strftime("%Y-%m-%d %H:%M") for r in rows],
+            "종목": [r["ticker"] for r in rows],
+            "유형": [r["event_type"] for r in rows],
+            "단계": ["최종 D+20" if r["stage"] == "D20" else "1차 D0" for r in rows],
+            "이벤트": [r["headline"] for r in rows],
+            "요약": [r["summary"] for r in rows],
+        })
+        st.caption(f"문서 {len(rows)}건 · 행을 클릭하면 아래에 문서가 열립니다.")
+        event = st.dataframe(df, hide_index=True, width="stretch", on_select="rerun",
+                             selection_mode="single-row", key="event_reports")
+        if event.selection.rows:
+            doc = Path(rows[event.selection.rows[0]]["path"])
+            st.divider()
+            if doc.exists():
+                body = doc.read_text(encoding="utf-8")
+                st.download_button("📄 문서 내려받기 (.md)", body, file_name=doc.name, mime="text/markdown")
+                st.markdown(body)
+            else:
+                st.warning(f"문서 파일이 없습니다: {doc}")
