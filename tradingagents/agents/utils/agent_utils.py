@@ -34,12 +34,32 @@ def get_language_instruction() -> str:
     return f" Write your entire response in {lang}."
 
 
-def build_instrument_context(ticker: str) -> str:
+def build_instrument_context(ticker: str, user_notes: str = "") -> str:
     """Describe the exact instrument so agents preserve exchange-qualified tickers."""
     return (
         f"The instrument to analyze is `{ticker}`. "
         "Use this exact ticker in every tool call, report, and recommendation, "
         "preserving any exchange suffix (e.g. `.TO`, `.L`, `.HK`, `.T`)."
+    ) + build_user_notes(user_notes)
+
+
+def build_user_notes(user_notes: str) -> str:
+    """Prompt section for notes typed by the person who requested the analysis.
+
+    The notes are unverified claims (upcoming events, context the data tools miss).
+    Agents must weigh them, attribute them, and not treat them as tool data.
+    Returns "" when there are no notes, so prompts are unchanged.
+    """
+    notes = (user_notes or "").strip()
+    if not notes:
+        return ""
+    return (
+        "\n\n## User-provided notes (unverified)\n"
+        "The person who requested this analysis supplied the notes below. They are not "
+        "tool data and may be wrong or incomplete. Consider every point in them, say "
+        "explicitly how each one affects your view (or why it does not), and label any "
+        "figure taken from them as \"user-provided\". Do not invent details beyond what "
+        "they state.\n<<<\n" + notes + "\n>>>\n"
     )
 
 def create_msg_delete():

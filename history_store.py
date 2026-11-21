@@ -212,6 +212,7 @@ def to_markdown(record: Dict[str, Any]) -> str:
         meta.insert(0, f"> ⚠️ {record['warning']}\n")
 
     sections = [
+        ("추가 참고 메모 (사용자 제공 · 미검증)", record.get("notes", "")),
         ("최종 거래 의사결정", s["final_trade_decision"]),
         ("시장 분석", s["market_report"]),
         ("소셜 분석", s["sentiment_report"]),

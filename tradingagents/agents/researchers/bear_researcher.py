@@ -1,3 +1,4 @@
+from tradingagents.agents.utils.agent_utils import build_user_notes
 
 
 def create_bear_researcher(llm):
@@ -27,7 +28,7 @@ Resources available:
 Market research report: {market_research_report}
 Social media sentiment report: {sentiment_report}
 Latest world affairs news: {news_report}
-Company fundamentals report: {fundamentals_report}
+Company fundamentals report: {fundamentals_report}{build_user_notes(state.get("user_notes", ""))}
 Conversation history of the debate: {history}
 Last bull argument: {current_response}
 Use this information to deliver a compelling bear argument, refute the bull's claims, and engage in a dynamic debate that demonstrates the risks and weaknesses of investing in the stock.

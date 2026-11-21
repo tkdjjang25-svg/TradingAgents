@@ -243,6 +243,22 @@ with st.sidebar:
     risk_rounds = st.slider("리스크 토론 라운드", 1, 5, 1)
 
     st.divider()
+    # 메모는 종목별로 따로 기억한다 (삼성전자용 메모가 다른 종목 분석에 섞이지 않게).
+    notes_by_ticker = st.session_state.setdefault("notes_by_ticker", {})
+    notes = st.text_area(
+        f"📝 추가 참고 메모 — {ticker} (선택)",
+        value=notes_by_ticker.get(ticker, ""),
+        key=f"notes::{ticker}",
+        max_chars=4000,
+        height=120,
+        placeholder="예: 2027-01-12 증여세 평가기간 종료, 1월 말 주주환원 정책 발표 예정 …",
+        help=(
+            "데이터 도구가 못 가져오는 일정·이슈를 적으면 분석가·토론자·매니저 모두에게 전달됩니다. "
+            "에이전트는 이 내용을 '사용자 제공·미검증' 정보로 보고 반영 여부를 밝힙니다. "
+            "틀린 정보를 넣으면 결론이 그쪽으로 기울 수 있으니 출처가 확실한 내용만 적어 주세요."
+        ),
+    )
+    notes_by_ticker[ticker] = notes
     requester = st.text_input(
         "🙋 요청자 이름 (선택)", key="requester", max_chars=20, placeholder="예: 민수",
         help="여러 사람이 같이 쓸 때 대기열에서 누구 작업인지 표시합니다.",
@@ -275,6 +291,9 @@ def render_record(record: dict, key_prefix: str) -> None:
         meta.append(f"**소요** {_mmss(record['elapsed_sec'])} · LLM {record.get('llm_calls')}회")
     meta.append(f"**저장** {record.get('saved_at', '').replace('T', ' ')}")
     st.markdown(" · ".join(meta))
+    if record.get("notes"):
+        with st.expander("📝 추가 참고 메모 (사용자 제공 · 미검증) — 이 내용이 에이전트에게 전달됨"):
+            st.text(record["notes"])
     if record.get("warning"):
         st.warning(record["warning"], icon="⚠️")
 
@@ -349,6 +368,7 @@ def _params_line(p: dict) -> str:
         f"**종목** `{p['ticker']}` · **기준일** `{p['trade_date']}` · **모델** `{p['provider']}` · "
         f"심층 `{p['deep_model']}` · 빠른 `{p['quick_model']}` · **분석가** {history_store.analysts_ko(p['analysts'])} · "
         f"**토론** {p['debate_rounds']}/{p['risk_rounds']}라운드 · **언어** {p['language']}"
+        + (f" · **📝 메모** {len(p['notes'])}자" if p.get("notes") else "")
     )
 
 
@@ -464,6 +484,7 @@ if run_button:
             debate_rounds=debate_rounds,
             risk_rounds=risk_rounds,
             language=lang_label,
+            notes=notes.strip(),
         )
         try:
             job, ahead = queue.submit(params, config, requester=requester)

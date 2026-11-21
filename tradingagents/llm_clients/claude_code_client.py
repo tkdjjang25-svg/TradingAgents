@@ -58,7 +58,8 @@ _TOOLS_NOTE = """
 
 Retrieve every price, indicator value, news item and financial figure you cite
 with the tools available to you. Never state a number that did not come from a
-tool result in this conversation; if a tool fails, say the data is unavailable."""
+tool result in this conversation or from a "User-provided notes" section of the
+prompt (label those as user-provided); if a tool fails, say the data is unavailable."""
 
 _NO_TOOLS_RETRY = (
     "\n\n(Your previous attempt answered without calling any tool. Call the data tools "
