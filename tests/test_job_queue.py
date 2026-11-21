@@ -189,6 +189,28 @@ class TestRunJob(unittest.TestCase):
         self.assertEqual(record["requester"], "민수")
         self.assertEqual(record["decision"], "Buy")
         self.assertNotIn("notes", record)
+        steps = record["step_times"]
+        self.assertEqual([s["node"] for s in steps], ["Market Analyst"])
+        self.assertEqual(steps[0]["calls"], 3)
+        self.assertGreaterEqual(steps[0]["sec"], 0)
+
+    def test_step_times_split_agents_and_prep(self):
+        job = Job(params=_params(), config=self.config)
+        job.started = 100.0
+        handler = job_queue.ProgressHandler(job)
+        clock = iter([103.0, 104.0, 110.0, 130.0, 131.0])
+        with patch.object(job_queue.time, "time", lambda: next(clock)):
+            for node in ("Market Analyst", "Market Analyst", "News Analyst", "Trader"):
+                handler.on_chat_model_start({}, [], metadata={"langgraph_node": node})
+            handler.finish()
+        self.assertEqual([(s["node"], s["sec"], s["calls"]) for s in job.step_times], [
+            ("", 3.0, 0), ("Market Analyst", 7.0, 2), ("News Analyst", 20.0, 1), ("Trader", 1.0, 1),
+        ])
+        self.assertEqual(job.step_times[0]["step"], job_queue.PREP_LABEL)
+        summary = job_queue.history_store.step_summary(job.step_times)
+        self.assertEqual((summary["analysts"], summary["rest"], summary["total"]), (27.0, 4.0, 31.0))
+        md = job_queue.history_store.step_table_md(job.step_times)
+        self.assertIn("분석가 구간 합계 27초 (87%)", md)
 
     def test_notes_reach_the_graph_and_the_saved_record(self):
         job = Job(params=_params(notes="1월 말 주주환원 발표 예정"), config=self.config)

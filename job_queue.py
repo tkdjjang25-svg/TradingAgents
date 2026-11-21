@@ -8,6 +8,7 @@
 이어서 처리한다 (실행 중이던 작업은 처음부터 다시 분석한다).
 """
 import json
+import logging
 import sys
 import threading
 import time
@@ -25,8 +26,14 @@ import history_store
 from tradingagents.agents.utils.agent_utils import normalize_position
 
 QUEUE_FILE = Path(TRADINGAGENTS_HOME) / "queue.json"
+# 다른 프로세스(관심 종목 자동 점검)가 분석을 맡기는 곳. 앱의 대기열이 주워 간다.
+INBOX_DIR = Path(TRADINGAGENTS_HOME) / "queue_inbox"
 MAX_QUEUED = 30
 KEEP_FINISHED = 30
+
+LANGUAGE_CODES = {"한국어": "Korean", "English": "English", "日本語": "Japanese", "中文": "Chinese"}
+_INBOX_MODELS = {"opus", "sonnet", "haiku"}
+_INBOX_ANALYSTS = ("market", "social", "news", "fundamentals")
 
 # LangGraph 노드 이름 → 화면 표시명
 AGENT_LABELS = {
@@ -43,6 +50,10 @@ AGENT_LABELS = {
     "Conservative Analyst": "🛡️ 보수적 리스크 분석가",
     "Portfolio Manager": "📋 포트폴리오 매니저",
 }
+
+PREP_LABEL = "⚙️ 준비 (그래프 생성 · 지난 결정 확인)"
+ANALYST_NODES = {"Market Analyst", "Social Analyst", "News Analyst", "Fundamentals Analyst"}
+log = logging.getLogger("job_queue")
 
 STATUS_KO = {
     "queued": "⏳ 대기",
@@ -63,6 +74,61 @@ class Cancelled(Exception):
 
 class QueueFull(Exception):
     pass
+
+
+def config_for(params: dict) -> dict:
+    """화면에서 고른 것과 같은 실행 설정을 params 로부터 만든다."""
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    config = DEFAULT_CONFIG.copy()
+    config.update(
+        llm_provider=params["provider"],
+        deep_think_llm=params["deep_model"],
+        quick_think_llm=params["quick_model"],
+        max_debate_rounds=params["debate_rounds"],
+        max_risk_discuss_rounds=params["risk_rounds"],
+        output_language=LANGUAGE_CODES.get(params["language"], "Korean"),
+    )
+    return config
+
+
+def clean_inbox_params(raw: dict) -> dict:
+    """다른 프로세스가 맡긴 작업은 허용된 값만 골라 다시 만든다 (Claude Code 구독 호출만)."""
+    import ticker_catalog
+
+    ticker = ticker_catalog.normalize(str(raw.get("ticker", "")))
+    if not ticker_catalog.is_valid_ticker(ticker):
+        raise ValueError(f"bad ticker: {ticker!r}")
+    trade_date = str(raw.get("trade_date", ""))
+    time.strptime(trade_date, "%Y-%m-%d")
+    deep, quick = raw.get("deep_model"), raw.get("quick_model")
+    if raw.get("provider") != "claude-code" or deep not in _INBOX_MODELS or quick not in _INBOX_MODELS:
+        raise ValueError("only claude-code with opus/sonnet/haiku")
+    analysts = [a for a in _INBOX_ANALYSTS if a in (raw.get("analysts") or [])]
+    if not analysts:
+        raise ValueError("no analysts")
+    rounds = [int(raw.get(k, 1)) for k in ("debate_rounds", "risk_rounds")]
+    if not all(1 <= r <= 5 for r in rounds):
+        raise ValueError("rounds out of range")
+    language = raw.get("language", "한국어")
+    if language not in LANGUAGE_CODES:
+        raise ValueError("bad language")
+    return dict(
+        ticker=ticker, trade_date=trade_date, provider="claude-code", deep_model=deep, quick_model=quick,
+        analysts=analysts, debate_rounds=rounds[0], risk_rounds=rounds[1], language=language,
+        notes=str(raw.get("notes", ""))[:4000], position=normalize_position(raw.get("position")),
+    )
+
+
+def drop_in_inbox(params: dict, requester: str, inbox: Path = INBOX_DIR) -> Path:
+    """앱 밖에서 분석을 맡긴다. 앱의 대기열이 몇 초 안에 가져가 순서대로 실행한다."""
+    clean_inbox_params(params)  # 잘못된 작업은 맡기기 전에 거른다
+    inbox.mkdir(parents=True, exist_ok=True)
+    path = inbox / f"{time.strftime('%Y%m%d-%H%M%S')}_{uuid.uuid4().hex[:6]}.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"params": params, "requester": requester}, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+    return path
 
 
 class DuplicateJob(Exception):
@@ -86,6 +152,7 @@ class Job:
     label: str = "대기 중"
     calls: int = 0
     steps: list = field(default_factory=list)
+    step_times: list = field(default_factory=list)  # 단계별 소요 시간 (이력에 저장)
     error: str = ""
     record_id: str = ""
     model_ids: list = field(default_factory=list)  # 실제로 응답한 모델 ID (claude-code)
@@ -120,7 +187,9 @@ class ProgressHandler(BaseCallbackHandler):
     def __init__(self, job: Job):
         self.job = job
         self.current = None
+        self.current_node = None
         self.current_start = job.started or time.time()
+        self.current_calls = 0
 
     def on_chat_model_start(self, serialized, messages, *, metadata=None, **kwargs):
         if self.job.cancel_requested:
@@ -129,9 +198,13 @@ class ProgressHandler(BaseCallbackHandler):
         label = AGENT_LABELS.get(node, node) if node else "🧠 지난 결정 회고"
         now = time.time()
         if label != self.current:
+            if self.current is None and self.job.started and now - self.job.started >= 1:
+                # 첫 LLM 호출 전 시간: 그래프 생성, 지난 결정 결과 확인 등
+                self.current, self.current_node, self.current_start = PREP_LABEL, "", self.job.started
             self._close_step(now)
-            self.current, self.current_start = label, now
+            self.current, self.current_node, self.current_start, self.current_calls = label, node or "", now, 0
         self.job.calls += 1
+        self.current_calls += 1
         self.job.label = f"{label} 작업 중 · LLM 호출 {self.job.calls}회째"
 
     def on_llm_end(self, response, **kwargs):
@@ -146,8 +219,18 @@ class ProgressHandler(BaseCallbackHandler):
             pass  # 표시용 정보라 분석을 멈출 이유가 없다
 
     def _close_step(self, now: float) -> None:
-        if self.current:
-            self.job.steps.append(f"✅ {self.current} — {mmss(now - self.current_start)}")
+        """끝난 단계를 기록한다. 단계 시간 = 이 에이전트의 LLM 호출 + 그 사이 도구(데이터) 실행."""
+        if not self.current:
+            return
+        sec = now - self.current_start
+        self.job.steps.append(f"✅ {self.current} — {mmss(sec)}")
+        self.job.step_times.append({
+            "step": self.current, "node": self.current_node,
+            "start": round(self.current_start - (self.job.started or self.current_start), 1),
+            "sec": round(sec, 1), "calls": self.current_calls,
+        })
+        log.info("[단계] %s %s — %.1fs (LLM %d회)", self.job.params.get("ticker"), self.current, sec,
+                 self.current_calls)
 
     def finish(self) -> None:
         self._close_step(time.time())
@@ -172,7 +255,7 @@ def run_job(job: Job, graph_factory: Callable) -> None:
             k: p[k]
             for k in ("provider", "deep_model", "quick_model", "analysts", "debate_rounds", "risk_rounds", "language")
         }
-        meta.update(elapsed_sec=round(job.elapsed), llm_calls=job.calls)
+        meta.update(elapsed_sec=round(job.elapsed), llm_calls=job.calls, step_times=job.step_times)
         if job.model_ids:
             meta["model_ids"] = job.model_ids
         if job.requester:
@@ -215,8 +298,10 @@ class JobQueue:
         busy: Callable[[], bool] = lambda: False,
         autostart: bool = True,
         poll_sec: float = 2.0,
+        inbox: Optional[Path] = None,
     ):
         self._runner, self._path, self._busy, self._poll = runner, path, busy, poll_sec
+        self._inbox = inbox
         self._cond = threading.Condition()
         self._jobs: List[Job] = []  # 대기·실행 중인 작업과 최근 끝난 작업, 추가된 순서
         self.version = 0  # 작업이 끝나거나 대기열이 바뀔 때마다 증가
@@ -296,6 +381,7 @@ class JobQueue:
     def _next(self) -> Optional[Job]:
         with self._cond:
             while not self._closed:
+                self._drain_inbox()
                 job = next((j for j in self._jobs if j.status == "queued"), None)
                 if job is not None and not self._busy():
                     job.status = "running"  # run_job이 started 등을 채운다
@@ -318,6 +404,31 @@ class JobQueue:
                 if self._closed:
                     return
                 self._changed()
+
+    def _drain_inbox(self) -> None:
+        """다른 프로세스가 맡긴 작업을 대기열 맨 뒤에 넣는다. 잠금을 잡은 상태에서 호출."""
+        if self._inbox is None or not self._inbox.is_dir():
+            return
+        for path in sorted(self._inbox.glob("*.json")):
+            try:
+                item = json.loads(path.read_text(encoding="utf-8"))
+                params = clean_inbox_params(item["params"])
+                self.submit(params, config_for(params), requester=str(item.get("requester", ""))[:20])
+            except QueueFull:
+                return  # 자리가 나면 다음에 다시
+            except DuplicateJob:
+                pass
+            except Exception:
+                log.exception("맡긴 작업을 읽지 못함: %s", path.name)
+                try:
+                    path.replace(path.with_suffix(".bad"))
+                except OSError:
+                    pass
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
     def _save(self) -> None:
         if self._path is None:

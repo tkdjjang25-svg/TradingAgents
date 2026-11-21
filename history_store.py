@@ -232,6 +232,30 @@ def analysts_ko(analysts: Optional[List[str]]) -> str:
     return ", ".join(_ANALYST_KO.get(a, a) for a in analysts or [])
 
 
+_ANALYST_NODES = {"Market Analyst", "Social Analyst", "News Analyst", "Fundamentals Analyst"}
+
+
+def step_summary(step_times: Optional[List[Dict[str, Any]]]) -> Dict[str, float]:
+    """단계 시간 합계 (초): 분석가 4명 구간 / 나머지 / 전체."""
+    steps = step_times or []
+    analysts = sum(s["sec"] for s in steps if s.get("node") in _ANALYST_NODES)
+    total = sum(s["sec"] for s in steps)
+    return {"analysts": analysts, "rest": total - analysts, "total": total}
+
+
+def step_table_md(step_times: Optional[List[Dict[str, Any]]]) -> str:
+    if not step_times:
+        return ""
+    rows = ["| 단계 | 시작 (분석 시작 후) | 소요 | LLM 호출 |", "|---|---|---|---|"]
+    for s in step_times:
+        rows.append(f"| {s['step']} | {s['start']:.0f}초 | {s['sec']:.1f}초 | {s['calls']}회 |")
+    sm = step_summary(step_times)
+    share = sm["analysts"] / sm["total"] * 100 if sm["total"] else 0
+    rows.append(f"\n분석가 구간 합계 {sm['analysts']:.0f}초 ({share:.0f}%) · 나머지 {sm['rest']:.0f}초 · "
+                f"전체 {sm['total']:.0f}초")
+    return "\n".join(rows)
+
+
 def to_markdown(record: Dict[str, Any]) -> str:
     """이력 1건을 내려받기용 마크다운 문서로 만든다."""
     s = record["state"]
@@ -268,5 +292,8 @@ def to_markdown(record: Dict[str, Any]) -> str:
         ("리스크 토론 — 보수적", risk["conservative_history"]),
         ("리스크 토론 — 중립적", risk["neutral_history"]),
     ]
+    timing = step_table_md(record.get("step_times"))
+    if timing:
+        sections.insert(1, ("단계별 소요 시간", timing))
     body = "\n\n".join(f"## {title}\n\n{text}" for title, text in sections if text)
     return f"# {record['ticker']} · 기준일 {record['trade_date']}\n\n" + "\n".join(meta) + "\n\n" + body + "\n"

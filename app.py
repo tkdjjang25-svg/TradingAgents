@@ -30,6 +30,8 @@ import news_event_agent
 import telegram_collector
 import job_queue
 import ticker_catalog
+import watchlist
+from tradingagents.agents.utils.agent_utils import normalize_position
 
 # ---------------------------------------------------------------------------
 # 페이지 설정
@@ -90,7 +92,8 @@ def _legacy_running() -> bool:
 
 queue = job_queue.shared_queue(
     lambda: job_queue.JobQueue(
-        runner=lambda job: job_queue.run_job(job, TradingAgentsGraph), busy=_legacy_running
+        runner=lambda job: job_queue.run_job(job, TradingAgentsGraph), busy=_legacy_running,
+        inbox=job_queue.INBOX_DIR,
     )
 )
 
@@ -364,6 +367,24 @@ def render_record(record: dict, key_prefix: str) -> None:
         st.info(record.get("decision") or "(없음)")
     with st.expander("최종 의사결정 원문 보기"):
         st.markdown(s["final_trade_decision"] or "(없음)")
+    if record.get("step_times"):
+        sm = history_store.step_summary(record["step_times"])
+        share = sm["analysts"] / sm["total"] * 100 if sm["total"] else 0
+        with st.expander(f"⏱ 단계별 소요 시간 — 분석가 구간 {_mmss(sm['analysts'])} ({share:.0f}%) · "
+                         f"나머지 {_mmss(sm['rest'])}"):
+            st.dataframe(
+                pd.DataFrame({
+                    "단계": [x["step"] for x in record["step_times"]],
+                    "시작 (초)": [x["start"] for x in record["step_times"]],
+                    "소요 (초)": [x["sec"] for x in record["step_times"]],
+                    "LLM 호출": [x["calls"] for x in record["step_times"]],
+                }),
+                hide_index=True, width="stretch",
+                column_config={"소요 (초)": st.column_config.ProgressColumn(
+                    format="%.1f", min_value=0, max_value=max(x["sec"] for x in record["step_times"]) or 1)},
+            )
+            st.caption("단계 시간 = 그 에이전트의 LLM 호출 + 호출 사이 데이터 도구 실행 시간. "
+                       "토론 단계는 라운드마다 다시 나옵니다.")
 
     c1, c2, _ = st.columns([1, 1, 3])
     c1.download_button(
@@ -566,8 +587,8 @@ if run_button:
 # ---------------------------------------------------------------------------
 # 메인 패널
 # ---------------------------------------------------------------------------
-tab_run, tab_history, tab_telegram, tab_events = st.tabs(
-    ["🚀 분석 · 대기열", "📚 분석 이력", "📨 텔레그램", "🧠 이벤트 분석"]
+tab_run, tab_watch, tab_history, tab_telegram, tab_events = st.tabs(
+    ["🚀 분석 · 대기열", "👀 관심 종목", "📚 분석 이력", "📨 텔레그램", "🧠 이벤트 분석"]
 )
 
 with tab_run:
@@ -717,3 +738,111 @@ with tab_events:
                 st.markdown(body)
             else:
                 st.warning(f"문서 파일이 없습니다: {doc}")
+
+
+# ---------------------------------------------------------------------------
+# 관심 종목 — 매일 자동 이슈 점검 (watchlist.py 가 실행)
+# ---------------------------------------------------------------------------
+_IMPORTANCE_ICON = {"높음": "🔴", "보통": "🟡", "낮음": "⚪"}
+_IMPACT_ICON = {"긍정": "🟢", "부정": "🔻", "중립": "▫️"}
+
+
+def _lookup_name(symbol: str) -> str:
+    for sym, label in ticker_catalog.search(symbol, limit=5):
+        if sym.upper() == symbol:
+            return label
+    return ""
+
+
+def _render_briefing(rec: dict) -> None:
+    icon = _IMPORTANCE_ICON.get(rec.get("importance"), "🟡")
+    pos = history_store.position_ko({"position": rec.get("position")})
+    st.markdown(f"#### {icon} {rec['ticker']} — {rec.get('headline', '')}")
+    st.caption(f"{rec.get('name') or ''} · 점검 {rec.get('created_at', '').replace('T', ' ')} · "
+               f"가격 기준 {rec.get('price_date') or '-'} · 중요도 {rec.get('importance')} · 포지션 {pos} · "
+               f"뉴스 {rec.get('inputs', {}).get('news', 0)}건 · 텔레그램 {rec.get('inputs', {}).get('telegram', 0)}건")
+    st.markdown(rec.get("summary", ""))
+    for issue in rec.get("issues", []):
+        st.markdown(f"- {_IMPACT_ICON.get(issue.get('impact'), '▫️')} **{issue.get('title')}** "
+                    f"({issue.get('source')}) — {issue.get('detail')}")
+    st.markdown(f"📈 {rec.get('price_comment', '')}")
+    full = "전체 분석 필요" if rec.get("needs_full_analysis") else "전체 분석 불필요"
+    st.caption(f"🧭 {full}: {rec.get('reason', '')}" + (f" → {rec['full_analysis']}" if rec.get("full_analysis") else ""))
+
+
+with tab_watch:
+    st.markdown(
+        f"매일 **{watchlist.RUN_AT}**에 아래 종목의 뉴스·텔레그램 언급·가격 변화를 모아 이슈 브리핑을 씁니다. "
+        f"중요한 새 이슈가 있으면 전체 분석(매수/매도 판단)을 자동으로 대기열에 넣습니다 "
+        f"(하루 최대 {watchlist.MAX_FULL}건, 결과는 📚 분석 이력)."
+    )
+    items = watchlist.load_watchlist()
+    editor_df = pd.DataFrame(
+        [{"티커": i["ticker"], "종목명": i["name"], "보유 중": i["held"],
+          "평균단가": i["avg_price"], "자동 전체 분석": i["auto_full"]} for i in items],
+        columns=["티커", "종목명", "보유 중", "평균단가", "자동 전체 분석"],
+    )
+    edited = st.data_editor(
+        editor_df, num_rows="dynamic", hide_index=True, width="stretch", key="watchlist_editor",
+        column_config={
+            "티커": st.column_config.TextColumn(help="Yahoo Finance 티커 (예: NVDA, 005930.KS)", required=True),
+            "종목명": st.column_config.TextColumn(help="비워 두면 저장할 때 자동으로 찾습니다. 텔레그램 글 검색에도 쓰입니다."),
+            "보유 중": st.column_config.CheckboxColumn(default=False),
+            "평균단가": st.column_config.NumberColumn(min_value=0.0, format="%.4g"),
+            "자동 전체 분석": st.column_config.CheckboxColumn(default=True, help="끄면 브리핑만 쓰고 전체 분석은 맡기지 않습니다."),
+        },
+    )
+    c1, c2, _ = st.columns([1, 1, 3])
+    if c1.button("💾 목록 저장", type="primary", width="stretch"):
+        new_items, bad = [], []
+        for _, row in edited.iterrows():
+            symbol = ticker_catalog.normalize(str(row["티커"] or ""))
+            if not symbol:
+                continue
+            if not ticker_catalog.is_valid_ticker(symbol):
+                bad.append(symbol)
+                continue
+            if symbol in {i["ticker"] for i in new_items}:
+                continue
+            name = str(row["종목명"] or "").strip() if pd.notna(row["종목명"]) else ""
+            avg = row["평균단가"] if pd.notna(row["평균단가"]) else None
+            new_items.append({
+                "ticker": symbol, "name": name or _lookup_name(symbol),
+                **normalize_position({"held": row["보유 중"] is True, "avg_price": avg}),
+                "auto_full": bool(row["자동 전체 분석"]) if pd.notna(row["자동 전체 분석"]) else True,
+            })
+        if bad:
+            st.error("티커 형식이 아닌 항목은 저장하지 않았습니다: " + ", ".join(bad))
+        watchlist.save_watchlist(new_items)
+        st.toast(f"관심 종목 {len(new_items)}개 저장", icon="✅")
+        st.rerun()
+    if c2.button("🔄 지금 점검", width="stretch", disabled=not items,
+                 help="정기 점검을 기다리지 않고 지금 모든 관심 종목을 점검합니다 (1분 안에 시작, 종목당 약 20초)."):
+        watchlist.request_run()
+        st.toast("점검을 요청했습니다. 1~2분 뒤 새로고침하세요.", icon="🔄")
+
+    state = watchlist._read_json(watchlist.STATE_FILE, {})
+    pending = watchlist.RUN_REQUEST.exists()
+    st.caption(f"마지막 정기 점검: {state.get('last_run') or '아직 없음'}"
+               + (" · ⏳ 요청한 점검 대기 중" if pending else ""))
+
+    briefs = watchlist.list_briefings(days=30)
+    if briefs:
+        st.divider()
+        latest = {}
+        for rec in briefs:
+            latest.setdefault(rec["ticker"], rec)
+        order = [i["ticker"] for i in items if i["ticker"] in latest] + [t for t in latest if t not in {i["ticker"] for i in items}]
+        st.markdown("### 🗞 종목별 최신 브리핑")
+        for symbol in order:
+            with st.container(border=True):
+                _render_briefing(latest[symbol])
+
+        with st.expander("📅 지난 브리핑 보기"):
+            dates = sorted({r["date"] for r in briefs}, reverse=True)
+            day = st.selectbox("날짜", dates, key="brief_day")
+            for rec in [r for r in briefs if r["date"] == day]:
+                with st.container(border=True):
+                    _render_briefing(rec)
+    elif items:
+        st.info("아직 브리핑이 없습니다. '🔄 지금 점검'을 누르거나 다음 정기 점검을 기다려 주세요.")

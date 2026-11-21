@@ -1,4 +1,5 @@
-# Keeps the Telegram collector, the event-analysis agent and the login gateway running.
+# Keeps the Telegram collector, the event-analysis agent, the login gateway and the
+# daily watchlist checker running.
 # Started at logon by the "TradingAgents services" scheduled task (see scripts/install_autostart.ps1).
 # Every minute it starts any service that is not running; logs go to data/logs/.
 
@@ -25,7 +26,8 @@ $env:PYTHONUNBUFFERED = '1'
 $Services = @(
     @{ Name = 'telegram';    Script = 'telegram_collector.py'; Verb = 'run' },
     @{ Name = 'event-agent'; Script = 'news_event_agent.py';   Verb = 'run' },
-    @{ Name = 'gateway';     Script = 'auth_gateway.py';       Verb = 'serve' }
+    @{ Name = 'gateway';     Script = 'auth_gateway.py';       Verb = 'serve' },
+    @{ Name = 'watchlist';   Script = 'watchlist.py';          Verb = 'run' }
 )
 
 function Test-Running($svc) {
