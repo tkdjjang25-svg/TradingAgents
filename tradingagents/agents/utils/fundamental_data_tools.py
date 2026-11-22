@@ -1,6 +1,7 @@
 from langchain_core.tools import tool
 from typing import Annotated
 from tradingagents.dataflows.interface import route_to_vendor
+from tradingagents.dataflows import regional_sources
 
 
 @tool
@@ -17,7 +18,12 @@ def get_fundamentals(
     Returns:
         str: A formatted report containing comprehensive fundamental data
     """
-    return route_to_vendor("get_fundamentals", ticker, curr_date)
+    text = route_to_vendor("get_fundamentals", ticker, curr_date)
+    try:  # Korean listings: add the key accounts filed with DART
+        extra = regional_sources.korean_financials(ticker, curr_date)
+    except Exception as exc:
+        extra = f"(DART financials unavailable: {type(exc).__name__})"
+    return f"{text}\n\n## DART key financials (Korean filings)\n{extra}" if extra else text
 
 
 @tool

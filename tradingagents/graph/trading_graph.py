@@ -35,6 +35,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_income_statement,
     get_news,
     get_insider_transactions,
+    get_disclosures,
     get_global_news
 )
 
@@ -174,6 +175,7 @@ class TradingAgentsGraph:
                     get_news,
                     get_global_news,
                     get_insider_transactions,
+                    get_disclosures,
                 ]
             ),
             "fundamentals": ToolNode(
@@ -183,6 +185,7 @@ class TradingAgentsGraph:
                     get_balance_sheet,
                     get_cashflow,
                     get_income_statement,
+                    get_disclosures,
                 ]
             ),
         }

@@ -760,7 +760,9 @@ def _render_briefing(rec: dict) -> None:
     st.markdown(f"#### {icon} {rec['ticker']} — {rec.get('headline', '')}")
     st.caption(f"{rec.get('name') or ''} · 점검 {rec.get('created_at', '').replace('T', ' ')} · "
                f"가격 기준 {rec.get('price_date') or '-'} · 중요도 {rec.get('importance')} · 포지션 {pos} · "
-               f"뉴스 {rec.get('inputs', {}).get('news', 0)}건 · 텔레그램 {rec.get('inputs', {}).get('telegram', 0)}건")
+               f"뉴스 {rec.get('inputs', {}).get('news', 0)}건 · 텔레그램 {rec.get('inputs', {}).get('telegram', 0)}건"
+               + "".join(f" · {label} {rec['inputs'][key]}건" for key, label in (("filings", "공시"), ("naver", "네이버"))
+                         if rec.get("inputs", {}).get(key)))
     st.markdown(rec.get("summary", ""))
     for issue in rec.get("issues", []):
         st.markdown(f"- {_IMPACT_ICON.get(issue.get('impact'), '▫️')} **{issue.get('title')}** "
