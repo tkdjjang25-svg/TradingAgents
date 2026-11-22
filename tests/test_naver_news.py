@@ -41,7 +41,8 @@ def _resp(status=200, items=None, total=None, body=None):
 class _Base(unittest.TestCase):
     def setUp(self):
         patches = [patch.object(nn, "_limiter", RateLimiter(0)),
-                   patch.object(nn, "_RETRY_BACKOFF", 0)]
+                   patch.object(nn, "_RETRY_BACKOFF", 0),
+                   patch.object(nn, "_RELEVANCE_PAGE", False)]  # paging tests count date-sorted calls
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -106,6 +107,17 @@ class TestDedupe(unittest.TestCase):
         self.assertEqual(samsung["similar"], 2)
         self.assertEqual(out[0]["url"], "u4")  # newest first
 
+    def test_same_body_under_a_new_title_is_merged(self):
+        body = "반면 같은 기간 삼성전자와 SK하이닉스 주가는 각각 27.24%, 48.60% 상승했다. 연초에는 코스피 5000선 돌파 기대감에"
+        arts = self._arts([
+            ("'삼전닉스' 빼면 남은 게 없다…연초로 퇴보한 코스피", "2026-11-22 12:34", "u1", body),
+            ("'시총 1조' 코스피 상장사, 1월 대비 11% 감소", "2026-11-22 12:46", "u2", body + " 시장 전반"),
+            ("삼성전자 주가 하락", "2026-11-22 08:00", "u3", "짧은 요약"),
+            ("삼성전자 주가 상승", "2026-11-22 09:00", "u4", "짧은 요약"),  # short summaries are not compared
+        ])
+        out = nn._dedupe(arts)
+        self.assertEqual(sorted(a["url"] for a in out), ["u1", "u3", "u4"])
+
     def test_exact_url_dupe_and_distinct_titles_kept(self):
         arts = self._arts([
             ("삼성전자 주가 상승", "2026-11-20 10:00", "same", "a"),
@@ -114,6 +126,39 @@ class TestDedupe(unittest.TestCase):
         ])
         out = nn._dedupe(arts)
         self.assertEqual([a["title"] for a in out], ["삼성전자 주가 상승", "삼성전자 주가 하락"])
+
+
+@pytest.mark.unit
+class TestRelevance(_Base):
+    def test_passing_mentions_drop_and_sim_ranked_articles_join(self):
+        date_items = [
+            _item("재계 인물 기사", "Sun, 22 Nov 2026 12:44:00 +0900", origin="https://a.example.com/1",
+                  desc="최태원 회장은 여러 총수의 맏형격이다. 모임과 행사에서 자연스럽게 말을 한다"),
+            _item("<b>삼성전자</b> HBM4 양산", "Sun, 22 Nov 2026 12:40:00 +0900", origin="https://a.example.com/2",
+                  desc="본문"),
+            _item("반도체 업황 점검", "Sun, 22 Nov 2026 12:30:00 +0900", origin="https://a.example.com/3",
+                  desc="삼성전자 실적 전망을 다시 짚어 본다"),
+        ]
+        sim_items = [
+            _item("삼성전자 주주환원 확대", "Fri, 20 Nov 2026 09:00:00 +0900", origin="https://a.example.com/4",
+                  desc="배당 확대"),
+            _item("오래된 삼성전자 기사", "Mon, 02 Nov 2026 09:00:00 +0900", origin="https://a.example.com/5"),
+        ]
+        with _env(), patch.object(nn, "_RELEVANCE_PAGE", True), patch.object(
+                nn.requests, "get", side_effect=[_resp(items=date_items), _resp(items=sim_items)]) as get:
+            out = nn.search_news("삼성전자", "2026-11-19", "2026-11-22", limit=10)
+        self.assertEqual(get.call_args_list[1][1]["params"]["sort"], "sim")
+        titles = [a["title"] for a in out]
+        self.assertEqual(titles, ["삼성전자 HBM4 양산", "반도체 업황 점검", "삼성전자 주주환원 확대"])  # newest first
+
+    def test_relevance_page_failure_keeps_date_results(self):
+        titles = ("삼성전자 HBM4 양산", "삼성전자 배당 확대", "삼성전자 노조 협상 타결")
+        items = [_item(t, f"Sun, 22 Nov 2026 1{i}:00:00 +0900", origin=f"https://a.example.com/{i}",
+                       desc=f"내용 {i}") for i, t in enumerate(titles)]
+        with _env(), patch.object(nn, "_RELEVANCE_PAGE", True), patch.object(
+                nn.requests, "get", side_effect=[_resp(items=items), _resp(status=401)]):
+            out = nn.search_news("삼성전자", "2026-11-19", "2026-11-22")
+        self.assertEqual(len(out), 3)
 
 
 @pytest.mark.unit
@@ -139,8 +184,18 @@ class TestSearch(_Base):
         _, kwargs = get.call_args
         self.assertEqual(kwargs["params"]["sort"], "date")
         self.assertEqual(kwargs["params"]["display"], 100)
-        self.assertEqual(kwargs["headers"]["X-Naver-Client-Id"], CID)
+        self.assertEqual(kwargs["headers"]["X-NCP-APIGW-API-KEY-ID"], CID)
+        self.assertEqual(kwargs["headers"]["X-NCP-APIGW-API-KEY"], SECRET)
+        self.assertEqual(get.call_args[0][0], nn.HUB_URL)
         self.assertEqual(kwargs["timeout"], nn._TIMEOUT)
+
+    def test_legacy_mode_uses_developers_center(self):
+        values = {"NAVER_CLIENT_ID": CID, "NAVER_CLIENT_SECRET": SECRET, "NAVER_API_MODE": "legacy"}
+        with patch.object(nn, "get_env", side_effect=lambda name: values.get(name, "")), \
+                patch.object(nn.requests, "get", return_value=_resp(items=[])) as get:
+            nn.search_news("삼성전자", "2026-11-18", "2026-11-22")
+        self.assertEqual(get.call_args[0][0], nn.LEGACY_URL)
+        self.assertEqual(get.call_args[1]["headers"]["X-Naver-Client-Id"], CID)
 
     def _page(self, day, n=100, prefix="기사"):
         return [_item(f"{prefix} {hashlib.md5(f'{day}-{i}'.encode()).hexdigest()[:16]}",
@@ -173,7 +228,7 @@ class TestSearch(_Base):
 
     def test_paging_stops_when_enough_stories(self):
         with _env(), patch.object(nn.requests, "get",
-                                  return_value=_resp(items=self._page(22), total=1000)) as get:
+                                  return_value=_resp(items=self._page(22, prefix="x 기사"), total=1000)) as get:
             out = nn.search_news("x", "2026-11-01", "2026-11-22", limit=5)
         self.assertEqual(get.call_count, 1)
         self.assertEqual(len(out), 5)

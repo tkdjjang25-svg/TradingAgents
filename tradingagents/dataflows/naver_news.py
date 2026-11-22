@@ -1,8 +1,10 @@
 """Korean news from the Naver Search API (news), cleaned for an LLM.
 
-Endpoint: GET https://openapi.naver.com/v1/search/news.json with the
-X-Naver-Client-Id / X-Naver-Client-Secret headers (NAVER_CLIENT_ID /
-NAVER_CLIENT_SECRET, read through ``get_env``; never logged or returned).
+Endpoint: GET https://naverapihub.apigw.ntruss.com/search/v1/news (NAVER API HUB)
+with the X-NCP-APIGW-API-KEY-ID / X-NCP-APIGW-API-KEY headers carrying the HUB
+application's Client ID / Client Secret (NAVER_CLIENT_ID / NAVER_CLIENT_SECRET, read
+through ``get_env``; never logged or returned). NAVER_API_MODE=legacy switches to the
+old Developers Center endpoint (openapi.naver.com, X-Naver-Client-Id/-Secret).
 
 Contract
 --------
@@ -37,7 +39,18 @@ from .external_common import RateLimiter, get_env
 
 logger = logging.getLogger(__name__)
 
-API_URL = "https://openapi.naver.com/v1/search/news.json"
+# Naver moved the Search API to NAVER Cloud's "NAVER API HUB" in 2026; new apps can only be
+# created there. Old Developers Center apps keep working for a while: NAVER_API_MODE=legacy.
+HUB_URL = "https://naverapihub.apigw.ntruss.com/search/v1/news"
+LEGACY_URL = "https://openapi.naver.com/v1/search/news.json"
+API_URL = HUB_URL
+
+
+def _endpoint(client_id: str, client_secret: str) -> Tuple[str, dict]:
+    """(url, auth headers) for the configured API flavour (default: NAVER API HUB)."""
+    if get_env("NAVER_API_MODE").lower() == "legacy":
+        return LEGACY_URL, {"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret}
+    return API_URL, {"X-NCP-APIGW-API-KEY-ID": client_id, "X-NCP-APIGW-API-KEY": client_secret}
 KST = timezone(timedelta(hours=9))
 
 _TIMEOUT = 10
@@ -217,27 +230,52 @@ def _similar(a: Tuple[str, frozenset], b: Tuple[str, frozenset]) -> bool:
         and matcher.ratio() >= _DUP_RATIO
 
 
+_BODY_MIN = 40  # summaries shorter than this are too generic to compare
+_BODY_PREFIX = 50
+_BODY_RATIO = 0.9
+
+
+def _body_key(summary: str) -> str:
+    """Compact summary text (no spaces/punctuation) for spotting the same body under a new title."""
+    return "".join(t for t in _NON_WORD.split(summary.lower()) if t and t != "_")
+
+
+def _same_body(a: str, b: str) -> bool:
+    if len(a) < _BODY_MIN or len(b) < _BODY_MIN:
+        return False
+    if a[:_BODY_PREFIX] == b[:_BODY_PREFIX]:
+        return True
+    matcher = SequenceMatcher(None, a, b, autojunk=False)
+    return matcher.real_quick_ratio() >= _BODY_RATIO and matcher.quick_ratio() >= _BODY_RATIO \
+        and matcher.ratio() >= _BODY_RATIO
+
+
 def _dedupe(articles: List[dict]) -> List[dict]:
     """Merge syndicated copies; keep each story's earliest (original) report.
 
     ``articles`` carry a private ``_dt`` (aware datetime). Exact URL repeats are
-    dropped first. Within a cluster the earliest article wins; ties go to the
-    longer summary. Output is newest first.
+    dropped first. Two articles are the same story when their titles are near
+    duplicates or their summaries are (one outlet re-titling the same body).
+    Within a cluster the earliest article wins; ties go to the longer summary.
+    Output is newest first.
     """
     seen_urls = set()
-    clusters: List[dict] = []  # {"keys": [...], "members": [...]}
+    clusters: List[dict] = []  # {"keys": [...], "bodies": [...], "members": [...]}
     for art in articles:
         if art["url"] and art["url"] in seen_urls:
             continue
         seen_urls.add(art["url"])
         key = _title_key(art["title"])
+        body = _body_key(art["summary"])
         for cluster in clusters:
-            if any(_similar(key, k) for k in cluster["keys"]):
+            if any(_similar(key, k) for k in cluster["keys"]) or \
+                    any(_same_body(body, b) for b in cluster["bodies"]):
                 cluster["keys"].append(key)
+                cluster["bodies"].append(body)
                 cluster["members"].append(art)
                 break
         else:
-            clusters.append({"keys": [key], "members": [art]})
+            clusters.append({"keys": [key], "bodies": [body], "members": [art]})
 
     out = []
     for cluster in clusters:
@@ -263,12 +301,12 @@ def _scrub(message: str, secrets: Tuple[str, ...]) -> str:
 
 
 def _request(params: dict, client_id: str, client_secret: str) -> dict:
-    headers = {"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret}
+    url, headers = _endpoint(client_id, client_secret)
     secrets = (client_id, client_secret)
     for attempt in (1, 2):
         _limiter.wait()
         try:
-            resp = requests.get(API_URL, params=params, headers=headers, timeout=_TIMEOUT)
+            resp = requests.get(url, params=params, headers=headers, timeout=_TIMEOUT)
         except (requests.Timeout, requests.ConnectionError) as exc:
             if attempt == 1:
                 time.sleep(_RETRY_BACKOFF)
@@ -399,13 +437,68 @@ def search_news(
             break  # no more results
         if start_dt and oldest is not None and oldest < start_dt:
             break  # already reached articles older than the window
-        if len(_dedupe(kept)) >= limit:
-            break  # enough distinct stories
+        if sum(1 for a in _dedupe(kept) if _compact(query) in _compact(a["title"])) >= limit:
+            break  # enough distinct stories about the query itself
 
-    articles = _dedupe(kept)[:limit]
+    # One relevance-sorted page: Naver's own ranking of how central the query is.
+    sim_rank = _relevance_page(query, client_id, client_secret, start_dt, end_dt, kept) \
+        if _RELEVANCE_PAGE else {}
+
+    articles = _select(_dedupe(kept), query, sim_rank, limit)
     for art in articles:
         art.pop("_dt", None)
     return articles
+
+
+_SIM_TOP = 30
+_RELEVANCE_PAGE = True  # one extra sort=sim request per search
+
+
+def _relevance_page(query, client_id, client_secret, start_dt, end_dt, kept: List[dict]) -> dict:
+    """Fetch Naver's relevance-sorted first page; add in-window articles to ``kept``.
+
+    Returns {url: rank}. A failure only costs the relevance signal.
+    """
+    ranks = {}
+    try:
+        data = _request({"query": query, "display": _DISPLAY, "start": 1, "sort": "sim"},
+                        client_id, client_secret)
+    except NaverNewsError:
+        logger.warning("Naver News: relevance page failed; using date order only")
+        return ranks
+    for rank, item in enumerate(data.get("items") or []):
+        art = _convert(item)
+        if art is None or (end_dt and art["_dt"] >= end_dt) or (start_dt and art["_dt"] < start_dt):
+            continue
+        ranks.setdefault(art["url"], rank)
+        kept.append(art)
+    return ranks
+
+
+def _compact(text: str) -> str:
+    return "".join(t for t in _NON_WORD.split((text or "").lower()) if t and t != "_")
+
+
+def _relevance(art: dict, query: str, sim_rank: dict) -> int:
+    """2 = query in the title, +1 = in the summary, +1 = in Naver's top relevance results."""
+    q = _compact(query)
+    score = 2 if q and q in _compact(art["title"]) else 0
+    score += 1 if q and q in _compact(art["summary"]) else 0
+    score += 1 if sim_rank.get(art["url"], _SIM_TOP) < _SIM_TOP else 0
+    return score
+
+
+def _select(articles: List[dict], query: str, sim_rank: dict, limit: int) -> List[dict]:
+    """The ``limit`` most relevant stories (recency breaks ties), returned newest first.
+
+    Passing mentions (query only somewhere in the body) are dropped unless there
+    would otherwise be fewer than 3 articles.
+    """
+    scored = sorted(articles, key=lambda a: (_relevance(a, query, sim_rank), a["_dt"]), reverse=True)
+    relevant = [a for a in scored if _relevance(a, query, sim_rank) > 0]
+    chosen = (relevant if len(relevant) >= min(3, limit) else scored)[:limit]
+    chosen.sort(key=lambda a: a["_dt"], reverse=True)
+    return chosen
 
 
 def get_news_naver(query: str, start_date: str, end_date: str, limit: int = 15) -> str:
