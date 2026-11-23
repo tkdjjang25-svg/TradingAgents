@@ -11,7 +11,7 @@ import json
 import logging
 import os
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -691,6 +691,64 @@ with tab_telegram:
                                file_name="telegram_messages.csv", mime="text/csv")
 
 
+def _ago(value) -> str:
+    """'11-22 22:36 (12분 전)' 형식 (KST)."""
+    if not value:
+        return "-"
+    dt = datetime.fromisoformat(str(value))
+    minutes = int((datetime.now(dt.tzinfo) - dt).total_seconds() // 60)
+    rel = f"{minutes}분 전" if minutes < 60 else f"{minutes // 60}시간 전" if minutes < 1440 else f"{minutes // 1440}일 전"
+    return f"{news_event_agent._kst(dt)} ({rel})"
+
+
+def _render_event_pipeline() -> None:
+    """뉴스가 언제 들어왔고, 각 이벤트 문서가 언제 나오는지."""
+    s = news_event_agent.pipeline_status()
+    if not s.get("ok"):
+        st.info("텔레그램 수집 데이터가 아직 없습니다.")
+        return
+    run = s.get("last_run") or {}
+    st.markdown("##### ⏱ 수집·분석 현황")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("마지막 수집 (5분마다)", _ago(run.get("finished_at")),
+              help="텔레그램 채널을 확인한 시각. 새 글이 없어도 5분마다 확인합니다.")
+    c2.metric("채널 마지막 새 글", _ago(s.get("last_message")), help=f"오늘 들어온 글 {s.get('messages_today', 0)}건")
+    c3.metric("분류 대기", f"{s.get('unclassified', 0)}건",
+              help=f"마지막 분류 {_ago(s.get('last_classified'))}. 새 글은 다음 5분 주기에 이벤트인지 분류합니다.")
+    c4.metric("오늘 작성한 문서", f"{s.get('reports_today', 0)} / {s.get('daily_limit', 20)}건",
+              help="하루(UTC) 문서 작성 상한")
+    if run.get("error"):
+        st.warning(f"마지막 수집 오류: {run['error']}")
+
+    auto = [e for e in s["events"] if e["auto"]]
+    manual = [e for e in s["events"] if not e["auto"]]
+    if auto:
+        st.markdown(f"**대기 중인 이벤트 {len(auto)}건** — 1차 문서는 뉴스가 반영된 첫 거래일 장 마감 뒤 "
+                    f"약 {news_event_agent.REPORT_LAG_MINUTES}분 안에, 최종은 20거래일 뒤에 작성됩니다.")
+        st.dataframe(pd.DataFrame({
+            "뉴스 일시": [news_event_agent._kst(e["news_date"]) for e in auto],
+            "종목": [e["ticker"] for e in auto],
+            "유형": [e["event_type"] for e in auto],
+            "이벤트": [e["headline"] for e in auto],
+            "상태": [e["state"] for e in auto],
+            "1차(D0) 예정": [news_event_agent._kst(e["d0_eta"]) if e["d0_eta"] else "완료" for e in auto],
+            "최종(D+20) 예정": [news_event_agent._kst(e["d20_eta"]) for e in auto],
+        }), hide_index=True, width="stretch")
+        st.caption("예정 시각은 한국 시간이며 주말만 건너뛴 추정입니다. 거래소 휴장일이 끼면 그만큼 늦어집니다.")
+    else:
+        st.caption("대기 중인 이벤트가 없습니다. 새 글이 이벤트로 분류되면 여기에 나타납니다.")
+    if manual:
+        with st.expander(f"자동 분석 시작({news_event_agent._kst(s.get('since'))}) 전 이벤트 {len(manual)}건 — 문서 없음"):
+            st.caption("비용 때문에 과거 글은 자동으로 쓰지 않습니다. 필요하면 소급 분석(backlog)을 요청하세요.")
+            st.dataframe(pd.DataFrame({
+                "뉴스 일시": [news_event_agent._kst(e["news_date"]) for e in manual],
+                "종목": [e["ticker"] for e in manual],
+                "유형": [e["event_type"] for e in manual],
+                "이벤트": [e["headline"] for e in manual],
+            }), hide_index=True, width="stretch")
+    st.divider()
+
+
 with tab_events:
     reports = news_event_agent.read_reports(limit=500)
     st.caption(
@@ -698,8 +756,9 @@ with tab_events:
         "1차(D0)는 뉴스가 반영된 첫 거래일 장 마감 뒤, 최종(D+20)은 20거래일 뒤에 다시 씁니다. "
         f"보관 위치 `{news_event_agent.REPORT_DIR}`"
     )
+    _render_event_pipeline()
     if not reports:
-        st.info("아직 작성된 문서가 없습니다. 이벤트 분석 에이전트(`news_event_agent.py run`)가 켜져 있어야 합니다.")
+        st.info("아직 작성된 문서가 없습니다. 위 '대기 중인 이벤트'의 1차 예정 시각이 지나면 생깁니다.")
     else:
         c1, c2, c3 = st.columns([2, 2, 3])
         tickers = sorted({r["ticker"] for r in reports})

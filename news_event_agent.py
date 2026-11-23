@@ -518,6 +518,131 @@ def read_reports(limit: int = 300, path: Path = DB_PATH) -> List[Dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
+# 앱 표시용: 수집·분류·문서 작성이 어디까지 왔는지, 다음 문서는 언제인지
+# ---------------------------------------------------------------------------
+_KST = timezone(timedelta(hours=9))
+CYCLE_MINUTES = 5  # run 의 기본 주기 (--interval 300)
+REPORT_LAG_MINUTES = 30  # 장 마감 뒤 일봉이 잡히고 다음 주기가 돌기까지의 여유
+
+
+def _exchange(ticker: str):
+    """(시간대, 장 마감 시각, 주말 휴장 여부)."""
+    from zoneinfo import ZoneInfo
+
+    t = ticker.upper()
+    if t.endswith((".KS", ".KQ")):
+        return ZoneInfo("Asia/Seoul"), (15, 30), True
+    if t.endswith(".T"):
+        return ZoneInfo("Asia/Tokyo"), (15, 0), True
+    if t.endswith("-USD"):
+        return timezone.utc, (23, 59), False
+    return ZoneInfo("America/New_York"), (16, 0), True
+
+
+def first_close_after(ticker: str, news_utc: datetime) -> datetime:
+    """뉴스가 처음 반영되는 거래일의 장 마감 시각 (UTC). 공휴일은 모르고 주말만 건너뛴다."""
+    tz, (hh, mm), weekdays_only = _exchange(ticker)
+    local = news_utc.astimezone(tz)
+    day = local.date()
+    if (local.hour, local.minute) >= (hh, mm):
+        day += timedelta(days=1)
+    while weekdays_only and day.weekday() >= 5:
+        day += timedelta(days=1)
+    return datetime(day.year, day.month, day.day, hh, mm, tzinfo=tz).astimezone(timezone.utc)
+
+
+def add_sessions(close_utc: datetime, ticker: str, n: int) -> datetime:
+    """close_utc 로부터 n 거래일 뒤의 장 마감 시각 (주말만 건너뜀)."""
+    tz, _, weekdays_only = _exchange(ticker)
+    local = close_utc.astimezone(tz)
+    while n > 0:
+        local += timedelta(days=1)
+        if not weekdays_only or local.weekday() < 5:
+            n -= 1
+    return local.astimezone(timezone.utc)
+
+
+def _kst(value) -> str:
+    if not value:
+        return "-"
+    dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    return dt.astimezone(_KST).strftime("%m-%d %H:%M")
+
+
+def pipeline_status(path: Path = DB_PATH, now: Optional[datetime] = None) -> Dict[str, Any]:
+    """수집기·에이전트 상태와 문서 대기 중인 이벤트 목록 (읽기 전용)."""
+    now = now or datetime.now(timezone.utc)
+    out: Dict[str, Any] = {"ok": False, "events": []}
+    if not path.exists():
+        return out
+    conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        one = lambda sql, *a: conn.execute(sql, a).fetchone()[0]  # noqa: E731
+        out["ok"] = True
+        if "runs" in tables:
+            row = conn.execute("SELECT finished_at, new, error FROM runs ORDER BY started_at DESC LIMIT 1").fetchone()
+            out["last_run"] = dict(row) if row else None
+        out["last_message"] = one("SELECT MAX(date) FROM messages") if "messages" in tables else None
+        day_start = now.astimezone(_KST).replace(hour=0, minute=0, second=0, microsecond=0)
+        out["messages_today"] = one("SELECT COUNT(*) FROM messages WHERE date >= ?",
+                                    day_start.astimezone(timezone.utc).isoformat(timespec="seconds")) \
+            if "messages" in tables else 0
+        if not {"agent_meta", "news_classified", "news_events", "news_reports"} <= tables:
+            return out
+        meta = conn.execute("SELECT value FROM agent_meta WHERE key='since'").fetchone()
+        since = meta[0] if meta else None
+        out["since"] = since
+        out["last_classified"] = one("SELECT MAX(classified_at) FROM news_classified")
+        out["unclassified"] = one(
+            "SELECT COUNT(*) FROM messages m LEFT JOIN news_classified c USING (chat_id, msg_id) "
+            "WHERE c.msg_id IS NULL AND m.date >= ?", since) if since else 0
+        out["reports_today"] = one("SELECT COUNT(*) FROM news_reports WHERE path IS NOT NULL AND created_at >= ?",
+                                   now.strftime("%Y-%m-%d"))
+        out["daily_limit"] = DAILY_LIMIT
+        rows = conn.execute(
+            """SELECT e.*,
+                      (SELECT MAX(stage) FROM news_reports r WHERE r.chat_id=e.chat_id AND r.msg_id=e.msg_id
+                         AND r.ticker=e.ticker AND r.path IS NOT NULL) AS done,
+                      (SELECT error FROM news_reports r WHERE r.chat_id=e.chat_id AND r.msg_id=e.msg_id
+                         AND r.ticker=e.ticker AND r.path IS NULL ORDER BY created_at DESC LIMIT 1) AS error
+               FROM news_events e ORDER BY e.news_date DESC"""
+        ).fetchall()
+    finally:
+        conn.close()
+
+    lag = timedelta(minutes=REPORT_LAG_MINUTES)
+    for e in rows:
+        if e["done"] == "D20":
+            continue
+        try:
+            news_utc = datetime.fromisoformat(e["news_date"])
+            d0_close = first_close_after(e["ticker"], news_utc)
+            d20_close = add_sessions(d0_close, e["ticker"], FINAL_SESSIONS)
+        except (TypeError, ValueError):
+            continue
+        auto = bool(since) and e["news_date"] >= since
+        d0_eta, d20_eta = d0_close + lag, d20_close + lag
+        if e["error"]:
+            state = "⚠️ 오류 (" + e["error"][:60] + ")"
+        elif not auto:
+            state = "⏸ 자동 대상 아님 (소급 분석 필요)"
+        elif e["done"] == "D0":
+            state = "✅ 1차 완료 · 최종 대기"
+        elif now >= d0_eta:
+            state = "✍️ 1차 작성 차례 (다음 주기)"
+        else:
+            state = "⏳ 장 마감 대기"
+        out["events"].append({
+            "news_date": e["news_date"], "ticker": e["ticker"], "event_type": e["event_type"],
+            "headline": e["headline"], "state": state, "auto": auto,
+            "d0_eta": None if e["done"] == "D0" else d0_eta, "d20_eta": d20_eta,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
 def run_cycle(conn, since: str) -> None:
     classify_pending(conn, since)
     process_reports(conn, since)
