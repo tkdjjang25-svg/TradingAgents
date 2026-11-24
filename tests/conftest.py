@@ -9,6 +9,16 @@ import pytest
 def pytest_configure(config):
     for marker in ("unit", "integration", "smoke"):
         config.addinivalue_line("markers", f"{marker}: {marker}-level tests")
+    # 테스트 임시 폴더도 시스템 임시 폴더가 아니라 저장소 data/tmp/tests 아래에 만든다.
+    import tempfile
+    from pathlib import Path
+
+    tmp_root = Path(__file__).resolve().parents[1] / "data" / "tmp" / "tests"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    tempfile.tempdir = str(tmp_root)
+    if not config.option.basetemp:
+        # pytest empties basetemp at start, so concurrent runs each need their own folder
+        config.option.basetemp = str(tmp_root / f"pytest-{os.getpid()}")
 
 
 _API_KEY_ENV_VARS = (

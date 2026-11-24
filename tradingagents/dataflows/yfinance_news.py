@@ -1,7 +1,9 @@
 """yfinance-based news data fetching functions."""
 
+import re
+
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timezone
 from dateutil.relativedelta import relativedelta
 
 from .stockstats_utils import yf_retry
@@ -38,14 +40,63 @@ def _extract_article_data(article: dict) -> dict:
             "pub_date": pub_date,
         }
     else:
-        # Fallback for flat structure
+        # Flat structure (yf.Search news): publish time is a unix timestamp
+        pub_date = None
+        ts = article.get("providerPublishTime")
+        if ts:
+            try:
+                pub_date = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+            except (ValueError, OverflowError, OSError, TypeError):
+                pass
         return {
             "title": article.get("title", "No title"),
             "summary": article.get("summary", ""),
             "publisher": article.get("publisher", "Unknown"),
             "link": article.get("link", ""),
-            "pub_date": None,
+            "pub_date": pub_date,
         }
+
+
+_CORP_SUFFIX = re.compile(
+    r"[\s,]+(co\.?,?\s*ltd\.?|company,?\s*limited|corporation|corp\.?|inc\.?|ltd\.?|plc|"
+    r"limited|holdings?|group|s\.?a\.?|n\.?v\.?|ag|se)$",
+    re.IGNORECASE,
+)
+
+
+def _company_query(name: str) -> str:
+    """'Samsung Electronics Co., Ltd.' -> 'Samsung Electronics'.
+
+    Yahoo's news search matches loosely on legal suffixes and returns unrelated
+    articles, while the bare company name finds the company's own news.
+    """
+    name = name.strip()
+    while True:
+        shorter = _CORP_SUFFIX.sub("", name).strip(" ,")
+        if shorter == name or not shorter:
+            return name
+        name = shorter
+
+
+def _search_news(ticker: str, count: int = 20) -> list:
+    """News via yf.Search, used when Ticker.get_news fails.
+
+    Ticker.get_news hits Yahoo's ncp endpoint, which sometimes answers with a
+    "Will be right back" page that yfinance reports as "Yahoo! Finance is
+    currently down", while the search endpoint keeps working. Searching by the
+    raw symbol finds nothing for many non-US tickers (e.g. 005930.KS), so the
+    company name from the search quotes is tried as well.
+    """
+    search = yf_retry(lambda: yf.Search(ticker, max_results=5, news_count=count))
+    if search.news:
+        return search.news
+    for quote in search.quotes or []:
+        if str(quote.get("symbol", "")).upper() != ticker.upper():
+            continue
+        name = _company_query(quote.get("longname") or quote.get("shortname") or "")
+        if name:
+            return yf_retry(lambda: yf.Search(name, max_results=0, news_count=count)).news or []
+    return []
 
 
 def get_news_yfinance(
@@ -66,7 +117,12 @@ def get_news_yfinance(
     """
     try:
         stock = yf.Ticker(ticker)
-        news = yf_retry(lambda: stock.get_news(count=20))
+        try:
+            news = yf_retry(lambda: stock.get_news(count=20))
+        except Exception:
+            news = None
+        if not news:
+            news = _search_news(ticker)
 
         if not news:
             return f"No news found for {ticker}"

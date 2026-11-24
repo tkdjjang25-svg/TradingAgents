@@ -1,6 +1,30 @@
 import os
 
-_TRADINGAGENTS_HOME = os.path.join(os.path.expanduser("~"), ".tradingagents")
+# 모든 데이터(로그·캐시·이력·텔레그램·문서·임시 파일)는 저장소 안 data/ 아래에 둔다.
+# 다른 위치를 쓰려면 TRADINGAGENTS_HOME 환경변수로 지정한다.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TRADINGAGENTS_HOME = os.getenv("TRADINGAGENTS_HOME") or os.path.join(_REPO_ROOT, "data")
+_TRADINGAGENTS_HOME = TRADINGAGENTS_HOME
+TMP_DIR = os.path.join(TRADINGAGENTS_HOME, "tmp")
+
+
+_YF_CACHE_SET = False
+
+
+def configure_yfinance_cache() -> None:
+    """yfinance 의 시간대·쿠키 캐시를 data/cache/yfinance 로 (기본값은 사용자 AppData). 한 번만 실행."""
+    global _YF_CACHE_SET
+    if _YF_CACHE_SET:
+        return
+    _YF_CACHE_SET = True
+    try:
+        import yfinance as yf
+
+        path = os.path.join(TRADINGAGENTS_HOME, "cache", "yfinance")
+        os.makedirs(path, exist_ok=True)
+        yf.set_tz_cache_location(path)
+    except Exception:
+        pass
 
 DEFAULT_CONFIG = {
     "project_dir": os.path.abspath(os.path.join(os.path.dirname(__file__), ".")),

@@ -35,6 +35,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_income_statement,
     get_news,
     get_insider_transactions,
+    get_disclosures,
     get_global_news
 )
 
@@ -174,6 +175,7 @@ class TradingAgentsGraph:
                     get_news,
                     get_global_news,
                     get_insider_transactions,
+                    get_disclosures,
                 ]
             ),
             "fundamentals": ToolNode(
@@ -183,6 +185,7 @@ class TradingAgentsGraph:
                     get_balance_sheet,
                     get_cashflow,
                     get_income_statement,
+                    get_disclosures,
                 ]
             ),
         }
@@ -261,7 +264,7 @@ class TradingAgentsGraph:
         if updates:
             self.memory_log.batch_update_with_outcomes(updates)
 
-    def propagate(self, company_name, trade_date):
+    def propagate(self, company_name, trade_date, user_notes="", position=None):
         """Run the trading agents graph for a company on a specific date.
 
         When ``checkpoint_enabled`` is set in config, the graph is recompiled
@@ -269,6 +272,12 @@ class TradingAgentsGraph:
         successful node on a subsequent invocation with the same ticker+date.
         """
         self.ticker = company_name
+
+        # Out-of-process providers (claude-code) need the analysis date explicitly:
+        # their tools run in a separate process and the CLI exposes the real date.
+        for llm in (self.deep_thinking_llm, self.quick_thinking_llm):
+            if hasattr(llm, "as_of_date"):
+                llm.as_of_date = str(trade_date)
 
         # Resolve any pending memory-log entries for this ticker before the pipeline runs.
         self._resolve_pending_entries(company_name)
@@ -292,19 +301,20 @@ class TradingAgentsGraph:
                 logger.info("Starting fresh for %s on %s", company_name, trade_date)
 
         try:
-            return self._run_graph(company_name, trade_date)
+            return self._run_graph(company_name, trade_date, user_notes, position)
         finally:
             if self._checkpointer_ctx is not None:
                 self._checkpointer_ctx.__exit__(None, None, None)
                 self._checkpointer_ctx = None
                 self.graph = self.workflow.compile()
 
-    def _run_graph(self, company_name, trade_date):
+    def _run_graph(self, company_name, trade_date, user_notes="", position=None):
         """Execute the graph and write the resulting state to disk and memory log."""
         # Initialize state — inject memory log context for PM.
         past_context = self.memory_log.get_past_context(company_name)
         init_agent_state = self.propagator.create_initial_state(
-            company_name, trade_date, past_context=past_context
+            company_name, trade_date, past_context=past_context, user_notes=user_notes,
+            position=position,
         )
         args = self.propagator.get_graph_args()
 
