@@ -102,6 +102,10 @@ class TestBriefingAndFullAnalysis(unittest.TestCase):
             p = patch.object(w, name, value)
             p.start()
             self.addCleanup(p.stop)
+        # 실제 분석 이력과 LLM 을 건드리지 않는다
+        p = patch.object(w.entry_plans, "watch", lambda item, closes: None)
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_briefing_is_saved_with_position_and_fenced_inputs(self):
         llm = _FakeLLM(importance="엄청남")

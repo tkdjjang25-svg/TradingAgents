@@ -40,7 +40,9 @@ from tradingagents.agents.utils.agent_utils import (  # noqa: E402
     normalize_position,
 )
 
+import entry_plans  # noqa: E402
 import job_queue  # noqa: E402
+import swing_rules  # noqa: E402
 import ticker_catalog  # noqa: E402
 
 log = logging.getLogger("watchlist")
@@ -55,6 +57,7 @@ TELEGRAM_DB = Path(TRADINGAGENTS_HOME) / "telegram" / "messages.db"
 
 MODEL = os.getenv("WATCHLIST_MODEL", "sonnet")
 RUN_AT = os.getenv("WATCHLIST_RUN_AT", "07:00")
+SCREEN_AT = os.getenv("SWING_SCREEN_AT", "16:10")  # 국내 장 마감 뒤 스윙 스크리닝 (평일)
 MAX_FULL = int(os.getenv("WATCHLIST_MAX_FULL", "3"))
 # 브리핑 LLM 호출을 동시에 몇 종목까지 돌릴지 (1 = 순서대로)
 CONCURRENCY = max(1, min(6, int(os.getenv("WATCHLIST_CONCURRENCY", "3"))))
@@ -169,7 +172,8 @@ def price_snapshot(ticker: str) -> Dict[str, Any]:
         f"Volume vs 20-day average: {'n/a' if vol_ratio is None else f'{vol_ratio:.2f}x'}; "
         f"20-day daily-move std: {'n/a' if sd20 is None else f'{sd20:.2f}%'}",
     ]
-    return {"text": "\n".join(lines), "d1": chg[1], "sd20": sd20, "last_date": str(close.index[-1].date())}
+    return {"text": "\n".join(lines), "d1": chg[1], "sd20": sd20, "last_date": str(close.index[-1].date()),
+            "closes": [(str(d.date()), float(v)) for d, v in close.tail(60).items()]}
 
 
 def yahoo_news(ticker: str, today: date) -> str:
@@ -267,6 +271,8 @@ Rules:
   regulation or litigation, management change) or an unusual move (daily move beyond ~2x its 20-day std with
   heavy volume). 보통 for relevant but incremental news. 낮음 when nothing material happened.
 - needs_full_analysis = true only when importance is 높음 and the fact could change a buy/hold/sell view.
+- If the latest full analysis' price plan is given, say in summary how close today's close is to its
+  conditions (or that one was just met). A script handles the trigger itself; do not raise importance for it.
 - Write every text field in Korean. Keep tickers as given."""
 
 
@@ -338,6 +344,12 @@ def write_briefing(item: Dict[str, Any], now: Optional[datetime] = None, llm=Non
             tg = f"(텔레그램 오류: {type(exc).__name__})"
         prev = previous_briefing(item["ticker"], str(today))
     extra, n_filings, n_naver = regional_inputs(item["ticker"], today)
+    entry = None
+    try:
+        entry = entry_plans.watch(item, price.get("closes") or [])
+    except Exception:
+        log.exception("%s 진입 조건 확인 실패", item["ticker"])
+    extra += entry_plans.prompt_section(entry)
 
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -361,6 +373,7 @@ def write_briefing(item: Dict[str, Any], now: Optional[datetime] = None, llm=Non
             "naver": n_naver,
         },
         "full_analysis": None,
+        "entry_watch": entry,
     }
     if record["importance"] not in ("낮음", "보통", "높음"):
         record["importance"] = "보통"
@@ -372,8 +385,12 @@ def write_briefing(item: Dict[str, Any], now: Optional[datetime] = None, llm=Non
 # 전체 분석 맡기기
 # ---------------------------------------------------------------------------
 def maybe_queue_full(item: Dict[str, Any], record: Dict[str, Any], state: Dict[str, Any], allow: bool) -> str:
-    """브리핑이 요청하면 전체 분석을 앱 대기열에 맡긴다. 결과 설명 문자열을 반환."""
-    if not record.get("needs_full_analysis"):
+    """브리핑이 요청하거나 직전 분석의 가격 조건이 새로 충족되면 전체 분석을 앱 대기열에 맡긴다.
+
+    결과 설명 문자열을 반환."""
+    entry = record.get("entry_watch")
+    triggered = entry_plans.is_triggered(entry)
+    if not record.get("needs_full_analysis") and not triggered:
         return ""
     if not allow or not item.get("auto_full", True):
         return "전체 분석 필요로 판단했지만 자동 실행이 꺼져 있음"
@@ -386,11 +403,17 @@ def maybe_queue_full(item: Dict[str, Any], record: Dict[str, Any], state: Dict[s
     notes = "자동 점검 브리핑에서 찾은 이슈 (아래 내용을 확인하고 반영할 것):\n" + record["headline"] + "\n" + "\n".join(
         f"- {i['title']}: {i['detail']}" for i in record.get("issues", [])
     )
+    if triggered:
+        notes = (f"직전 분석({entry.get('trade_date')}, {entry.get('decision')})의 가격 조건이 새로 충족됨: "
+                 f"{entry['status_ko']} — " + "; ".join(entry["fired"])
+                 + f" (종가 {entry['last_close']}, {entry['last_date']}). 이 조건대로 행동할지 다시 판단할 것.\n\n"
+                 + notes)
     params = dict(FULL_ANALYSIS, ticker=item["ticker"], trade_date=day, notes=notes[:4000],
                   position=normalize_position(item))
     job_queue.drop_in_inbox(params, REQUESTER)
     done.append(item["ticker"])
-    return "전체 분석을 대기열에 맡김 (분석 이력에 결과가 쌓임)"
+    why = f"{entry['status_ko']} → " if triggered else ""
+    return why + "전체 분석을 대기열에 맡김 (분석 이력에 결과가 쌓임)"
 
 
 def run_all(tickers: Optional[List[str]] = None, allow_full: bool = True) -> int:
@@ -437,6 +460,21 @@ def _due(now: datetime, state: Dict[str, Any]) -> bool:
     return now.time() >= datetime.min.replace(hour=hh, minute=mm).time() and state.get("last_run") != str(now.date())
 
 
+def _screen_due(now: datetime, state: Dict[str, Any]) -> bool:
+    hh, mm = (int(x) for x in SCREEN_AT.split(":"))
+    return (now.weekday() < 5 and now.time() >= datetime.min.replace(hour=hh, minute=mm).time()
+            and state.get("last_screen") != str(now.date()))
+
+
+def run_screen() -> int:
+    """설정의 종목군 + 관심 종목을 스윙 규칙으로 거른다 (결과는 앱의 📐 스윙 매매 → 스크리너)."""
+    settings = swing_rules.load_settings()
+    items = load_watchlist()
+    tickers = swing_rules.universe(settings, [i["ticker"] for i in items])
+    out = swing_rules.run_screen(tickers, settings, held={i["ticker"]: i for i in items})
+    return sum(1 for r in out["rows"] if r.get("setup"))
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="관심 종목 자동 점검")
     parser.add_argument("command", choices=["run", "once"])
@@ -466,6 +504,13 @@ def main(argv=None) -> None:
                 state = _read_json(STATE_FILE, {})
                 state["last_run"] = str(now.date())
                 _write_json(STATE_FILE, state)
+            if swing_rules.load_settings().get("auto_screen", True) and _screen_due(now, state):
+                state["last_screen"] = str(now.date())
+                _write_json(STATE_FILE, state)
+                log.info("스윙 스크리닝 실행")
+                log.info("스윙 스크리닝: 신호 %d종목", run_screen())
+            # 최근 분석의 진입 조건을 한 건씩 정리해 둔다 (앱의 분석 결과 화면과 다음 점검이 쓴다).
+            entry_plans.backfill(limit=1)
         except Exception:
             log.exception("점검 주기 실패 — 1분 뒤 다시 확인")
         time.sleep(30)
